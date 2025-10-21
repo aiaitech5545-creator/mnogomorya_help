@@ -1,0 +1,567 @@
+BOT_TOKEN=8220122658:AAFCndoQ6gNGnoj7PC0Dz4GiGGQ7YPJiPtw
+PROVIDER_TOKEN=
+ADMIN_CHAT_ID=211779388
+SESSION_PRICE=5000
+TZ=Europe/Stockholm
+
+GOOGLE_SHEET_ID=1K3_X_KpZe0dfFGfkCNPCn2ntgPP5pT2GznKCqPNrk2o
+SHEET_WORKSHEET_NAME=Form Responses
+
+USE_GOOGLE_CALENDAR=1
+GOOGLE_CALENDAR_ID=primary
+MEETING_DURATION_MIN=60
+
+GOOGLE_OAUTH_CLIENT_JSON={"installed":{...}}
+OAUTH_TOKEN_FILE=token.json
+
+BOT_TOKEN=8220122658:AAFCndoQ6gNGnoj7PC0Dz4GiGGQ7YPJiPtw
+PROVIDER_TOKEN=
+ADMIN_CHAT_ID=211779388
+SESSION_PRICE=5000
+TZ=Europe/Stockholm
+
+GOOGLE_SHEET_ID=1K3_X_KpZe0dfFGfkCNPCn2ntgPP5pT2GznKCqPNrk2o
+SHEET_WORKSHEET_NAME=Form Responses
+
+USE_GOOGLE_CALENDAR=1
+GOOGLE_CALENDAR_ID=primary
+MEETING_DURATION_MIN=60
+
+GOOGLE_OAUTH_CLIENT_JSON={"installed":{...}}
+OAUTH_TOKEN_FILE=token.json
+
+aiogram==3.4.1
+python-dotenv==1.0.1
+aiosqlite==0.20.0
+pytz==2025.1
+aiohttp==3.9.5
+gspread==5.12.4
+google-api-python-client==2.143.0
+google-auth==2.35.0
+google-auth-httplib2==0.2.0
+httplib2==0.22.0
+
+google-auth-oauthlib==1.2.1
+
+# Telegram Consultation Bot — Sheets + Calendar
+
+## Новое
+- Отправка анкет в **Google Sheets**.
+- Слоты для записи берутся из **Google Calendar**: бот показывает только свободные окна (по вашим фиксированным времени SLOTS_LOCAL), учитывая занятость календаря.
+
+## Настройка Google
+1) В Google Cloud Console создайте **Service Account** и выдайте ему роль доступа к Sheets/Calendar (или просто создайте ключ).
+2) Получите JSON ключ и:
+   - Либо вставьте целиком в переменную окружения **GOOGLE_SERVICE_ACCOUNT_JSON** (одной строкой),
+   - Либо загрузите файл и укажите путь в **GOOGLE_CREDENTIALS_FILE**.
+3) **Поделитесь** нужным календарём и таблицей с адресом сервис-аккаунта (вида `name@project.iam.gserviceaccount.com`) с правом:
+   - Calendar: `Просмотр сведений обо всех событиях` (Reader) достаточно.
+   - Sheets: `Редактор` (Editor), чтобы бот мог добавлять строки.
+4) Заполните переменные окружения:
+```
+GOOGLE_SERVICE_ACCOUNT_JSON=...  # или GOOGLE_CREDENTIALS_FILE=/app/creds.json
+GOOGLE_SHEET_ID=...              # ID таблицы (из URL)
+SHEET_WORKSHEET_NAME=Form Responses
+GOOGLE_CALENDAR_ID=you@example.com  # ID календаря (обычно email)
+MEETING_DURATION_MIN=60
+USE_GOOGLE_CALENDAR=1
+```
+5) Фиксированные часы для кандидатов слотов меняются в `booking.py` → `SLOTS_LOCAL`.
+
+## Как это работает
+- При завершении `/anketa` данные сохраняются локально в SQLite и отправляются в Sheets (если настроено).
+- При `/book` бот строит список слотов на 7 дней вперёд, но **фильтрует** их через FreeBusy API календаря — занятые окна не показываются.
+
+## Запуск
+```bash
+pip install -r requirements.txt
+python app.py
+```
+
+
+## Использовать обычный Google Календарь (OAuth, без сервис-аккаунта)
+1. В Google Cloud Console создайте **OAuth Client** типа *Desktop App* и скачайте `client_secret_*.json`.
+2. Откройте `.env` и вставьте содержимое этого файла одной строкой в `GOOGLE_OAUTH_CLIENT_JSON=` (или укажите путь для сохранения токена `OAUTH_TOKEN_FILE=token.json`).
+3. Поставьте `GOOGLE_CALENDAR_ID=primary` (или email нужного календаря).
+4. Запустите `python app.py` — откроется браузер, войдите в Google и разрешите доступ. Токен сохранится в `token.json`.
+5. Для деплоя можете скопировать содержимое `token.json` в переменную окружения `GOOGLE_OAUTH_TOKEN_JSON`.
+
+
+import asyncio
+import re
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery, LabeledPrice, PreCheckoutQuery, ContentType
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiohttp import web
+
+# импортируем настройки и модули
+from config import (
+    BOT_TOKEN, PROVIDER_TOKEN, BASE_URL, ADMIN_CHAT_ID,
+    SESSION_PRICE, CURRENCY, MEETING_DURATION_MIN
+)
+from storage import init_db, upsert_user, save_form, is_slot_taken, reserve_slot, mark_paid, latest_reserved_booking
+from booking import fmt
+from google_integration import available_slots_from_calendar, append_form_to_sheet
+
+# -------------------------------------------
+
+class Form(StatesGroup):
+    lastname = State()
+    firstname = State()
+    patronymic = State()
+    position = State()
+    shiptype = State()
+    experience = State()
+    questions = State()
+    email = State()
+    telegram = State()
+
+from aiogram.client.default import DefaultBotProperties
+
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+
+dp = Dispatcher()
+
+WELCOME = (
+    "Привет! Я бот для записи на консультацию.\n\n"
+    "Команды:\n"
+    "/anketa — заполнить анкету\n"
+    "/book — выбрать слот\n"
+    "/help — помощь\n"
+)
+
+# -------------------------------------------
+
+@dp.message(Command("start"))
+async def cmd_start(m: Message, state: FSMContext):
+    await upsert_user(m.from_user.id, m.from_user.username or "", m.from_user.first_name or "", m.from_user.last_name or "")
+    await m.answer(WELCOME)
+
+@dp.message(Command("help"))
+async def cmd_help(m: Message):
+    await m.answer(WELCOME)
+
+# -------------------------------------------
+# Анкета
+
+@dp.message(Command("anketa"))
+async def start_form(m: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(Form.lastname)
+    await m.answer("Введите вашу <b>фамилию</b>:")
+
+@dp.message(Form.lastname)
+async def form_lastname(m: Message, state: FSMContext):
+    await state.update_data(lastname=m.text.strip())
+    await state.set_state(Form.firstname)
+    await m.answer("Введите ваше <b>имя</b>:")
+
+@dp.message(Form.firstname)
+async def form_firstname(m: Message, state: FSMContext):
+    await state.update_data(firstname=m.text.strip())
+    await state.set_state(Form.patronymic)
+    await m.answer("Введите ваше <b>отчество</b> (если нет — поставьте '-'):")
+
+@dp.message(Form.patronymic)
+async def form_patronymic(m: Message, state: FSMContext):
+    await state.update_data(patronymic=m.text.strip())
+    await state.set_state(Form.position)
+    await m.answer("Укажите вашу <b>текущую должность</b> на судне:")
+
+@dp.message(Form.position)
+async def form_position(m: Message, state: FSMContext):
+    await state.update_data(position=m.text.strip())
+    await state.set_state(Form.shiptype)
+    await m.answer("Укажите <b>тип судна</b> (например: танкер, балкер, контейнеровоз):")
+
+@dp.message(Form.shiptype)
+async def form_shiptype(m: Message, state: FSMContext):
+    await state.update_data(shiptype=m.text.strip())
+    await state.set_state(Form.experience)
+    await m.answer("Ваш <b>опыт работы</b> (в годах или кратко):")
+
+@dp.message(Form.experience)
+async def form_experience(m: Message, state: FSMContext):
+    await state.update_data(experience=m.text.strip())
+    await state.set_state(Form.questions)
+    await m.answer("Какие <b>вопросы</b> вы хотели бы обсудить на консультации?")
+
+@dp.message(Form.questions)
+async def form_questions(m: Message, state: FSMContext):
+    await state.update_data(questions=m.text.strip())
+    await state.set_state(Form.email)
+    await m.answer("Введите ваш <b>e-mail</b>:")
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+@dp.message(Form.email)
+async def form_email(m: Message, state: FSMContext):
+    email = m.text.strip()
+    if not EMAIL_RE.match(email):
+        await m.answer("Похоже, это не e-mail. Пример: name@example.com\nПопробуйте ещё раз:")
+        return
+    await state.update_data(email=email)
+    await state.set_state(Form.telegram)
+    preset = m.from_user.username
+    hint = f" (например, @{preset})" if preset else ""
+    await m.answer(f"Введите ваш <b>ник в Telegram</b>{hint}:")
+
+@dp.message(Form.telegram)
+async def form_telegram(m: Message, state: FSMContext):
+    tg = m.text.strip()
+    if not re.match(r"^@[A-Za-z0-9_]{5,32}$", tg):
+        preset = m.from_user.username
+        example = f"@{preset}" if preset else "@your_username"
+        await m.answer(f"Ник должен начинаться с @ и содержать 5–32 символа (латиница, цифры, _). Пример: {example}\nПопробуйте ещё раз:")
+        return
+
+    data = await state.get_data()
+    lastname = data.get("lastname", "")
+    firstname = data.get("firstname", "")
+    patronymic = data.get("patronymic", "")
+    position = data.get("position", "")
+    shiptype = data.get("shiptype", "")
+    experience = data.get("experience", "")
+    questions = data.get("questions", "")
+    email = data.get("email", "")
+
+    full_name = " ".join(x for x in [lastname, firstname, patronymic] if x and x != "-")
+    topic = (
+        f"Должность: {position}\n"
+        f"Тип судна: {shiptype}\n"
+        f"Опыт: {experience}\n"
+        f"Вопросы: {questions}\n"
+        f"Telegram: {tg}"
+    )
+
+    await save_form(m.from_user.id, full_name, email, "", topic)
+
+    try:
+        append_form_to_sheet({
+            "user_id": str(m.from_user.id),
+            "username": f"@{m.from_user.username}" if m.from_user.username else "",
+            "full_name": full_name,
+            "position": position,
+            "ship_type": shiptype,
+            "experience": experience,
+            "questions": questions,
+            "email": email,
+            "telegram": tg,
+        })
+    except Exception:
+        await m.answer("Анкета сохранена локально, но не удалось отправить в Google Sheets.")
+
+    preview = (
+        f"<b>ФИО:</b> {full_name or '—'}\n"
+        f"<b>Должность:</b> {position or '—'}\n"
+        f"<b>Тип судна:</b> {shiptype or '—'}\n"
+        f"<b>Опыт:</b> {experience or '—'}\n"
+        f"<b>Вопросы:</b> {questions or '—'}\n"
+        f"<b>E-mail:</b> {email or '—'}\n"
+        f"<b>Telegram:</b> {tg or '—'}\n\n"
+        f"Длительность консультации — {MEETING_DURATION_MIN // 60} час.\n"
+        "Теперь можно выбрать слот: /book"
+    )
+
+    await m.answer(preview)
+
+# -------------------------------------------
+# Слоты и оплата
+
+def slots_keyboard():
+    kb = InlineKeyboardBuilder()
+    for dt in available_slots_from_calendar(days=7):
+        iso = dt.isoformat()
+        kb.button(text=fmt(dt), callback_data=f"slot:{iso}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+@dp.message(Command("book"))
+async def cmd_book(m: Message):
+    txt = f"Выберите удобное время (сеанс длится {MEETING_DURATION_MIN // 60} час):"
+    await m.answer(txt, reply_markup=slots_keyboard())
+
+@dp.callback_query(F.data.startswith("slot:"))
+async def pick_slot(cq: CallbackQuery):
+    iso = cq.data.split(":", 1)[1]
+    if await is_slot_taken(iso):
+        await cq.answer("Увы, слот уже занят. Выберите другой.", show_alert=True)
+        await cq.message.edit_reply_markup(reply_markup=slots_keyboard())
+        return
+    booking_id = await reserve_slot(cq.from_user.id, iso)
+    prices = [LabeledPrice(label="Сессия консультации", amount=SESSION_PRICE)]
+    await cq.message.answer_invoice(
+        title="Запись на консультацию",
+        description=f"Слот: {iso} (длительность: {MEETING_DURATION_MIN // 60} час)",
+        payload=f"booking:{booking_id}",
+        provider_token=PROVIDER_TOKEN,
+        currency=CURRENCY,
+        prices=prices
+    )
+    await cq.answer()
+
+@dp.pre_checkout_query()
+async def pre_checkout(pre: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre.id, ok=True)
+
+@dp.message(F.content_type == ContentType.SUCCESSFUL_PAYMENT)
+async def successful_payment(m: Message):
+    payload = m.successful_payment.invoice_payload
+    if payload.startswith("booking:"):
+        booking_id = int(payload.split(":", 1)[1])
+        await mark_paid(booking_id)
+        await m.answer("Оплата получена! До встречи на консультации.\nЕсли нужно перенести — напишите здесь.")
+        if ADMIN_CHAT_ID:
+            text = (
+                f"Новая оплаченная консультация!\n"
+                f"Пользователь: @{m.from_user.username} ({m.from_user.id})\n"
+                f"Сумма: {m.successful_payment.total_amount / 100:.2f} {m.successful_payment.currency}"
+            )
+            try:
+                await bot.send_message(int(ADMIN_CHAT_ID), text)
+            except Exception:
+                pass
+
+# -------------------------------------------
+# Запуск
+
+async def on_startup(app: web.Application):
+    await init_db()
+
+def build_app():
+    app = web.Application()
+    app.on_startup.append(on_startup)
+    return app
+
+async def run_polling():
+    await init_db()
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+if __name__ == "__main__":
+    asyncio.run(run_polling())
+
+from datetime import datetime
+import pytz
+from typing import List
+from config import TZ
+
+# Define preferred local start times for sessions (used as candidates)
+from datetime import time
+SLOTS_LOCAL = [time(10,0), time(14,0), time(18,0)]
+
+def fmt(dt:datetime) -> str:
+    return dt.strftime("%a, %d %b %Y %H:%M (%Z)")
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+PROVIDER_TOKEN = os.getenv("PROVIDER_TOKEN", "")
+BASE_URL = os.getenv("BASE_URL", "")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
+SESSION_PRICE = int(os.getenv("SESSION_PRICE", "5000"))  # minor units
+CURRENCY = "EUR"
+TZ = os.getenv("TZ", "Europe/Stockholm")
+
+# Google integrations
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")  # paste JSON here (single line)
+GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "")          # or path to creds json
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")                          # target spreadsheet ID
+SHEET_WORKSHEET_NAME = os.getenv("SHEET_WORKSHEET_NAME", "Form Responses")  # tab name
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "")                    # calendar id (email-like)
+MEETING_DURATION_MIN = int(os.getenv("MEETING_DURATION_MIN", "60"))
+USE_GOOGLE_CALENDAR = os.getenv("USE_GOOGLE_CALENDAR", "1") in ("1","true","True","yes")
+
+GOOGLE_OAUTH_CLIENT_JSON=os.getenv('GOOGLE_OAUTH_CLIENT_JSON','')
+GOOGLE_OAUTH_TOKEN_JSON=os.getenv('GOOGLE_OAUTH_TOKEN_JSON','')
+OAUTH_TOKEN_FILE=os.getenv('OAUTH_TOKEN_FILE','token.json')
+
+from typing import List, Dict, Tuple
+import json, os, pytz
+from datetime import datetime, timedelta
+from config import (GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_CREDENTIALS_FILE, GOOGLE_SHEET_ID, SHEET_WORKSHEET_NAME, GOOGLE_CALENDAR_ID, MEETING_DURATION_MIN, TZ, USE_GOOGLE_CALENDAR, GOOGLE_OAUTH_CLIENT_JSON, GOOGLE_OAUTH_TOKEN_JSON, OAUTH_TOKEN_FILE)
+from booking import SLOTS_LOCAL
+from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as UserCredentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+import gspread
+from googleapiclient.discovery import build
+
+SCOPES=[
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "openid",
+]
+
+_creds=None
+_gs_client=None
+_cal=None
+
+def _load_user_oauth_creds():
+    creds=None
+    if GOOGLE_OAUTH_TOKEN_JSON:
+        try:
+            creds=UserCredentials.from_authorized_user_info(json.loads(GOOGLE_OAUTH_TOKEN_JSON), SCOPES)
+            if creds and creds.valid:
+                return creds
+        except Exception:
+            pass
+    if OAUTH_TOKEN_FILE and os.path.exists(OAUTH_TOKEN_FILE):
+        try:
+            creds=UserCredentials.from_authorized_user_file(OAUTH_TOKEN_FILE, SCOPES)
+            if creds and creds.valid:
+                return creds
+        except Exception:
+            pass
+    if GOOGLE_OAUTH_CLIENT_JSON:
+        client_cfg=json.loads(GOOGLE_OAUTH_CLIENT_JSON)
+        flow=InstalledAppFlow.from_client_config(client_cfg, SCOPES)
+        creds=flow.run_local_server(open_browser=True, port=8080, prompt="consent")
+        if OAUTH_TOKEN_FILE:
+            with open(OAUTH_TOKEN_FILE,"w",encoding="utf-8") as f:
+                f.write(creds.to_json())
+        return creds
+    return None
+
+def _load_service_account_creds():
+    if GOOGLE_SERVICE_ACCOUNT_JSON:
+        info=json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    if GOOGLE_CREDENTIALS_FILE and os.path.exists(GOOGLE_CREDENTIALS_FILE):
+        return service_account.Credentials.from_service_account_file(GOOGLE_CREDENTIALS_FILE, scopes=SCOPES)
+    return None
+
+def _load_creds():
+    global _creds
+    if _creds: return _creds
+    creds=_load_user_oauth_creds()
+    if not creds:
+        creds=_load_service_account_creds()
+    if not creds:
+        raise RuntimeError("Google auth not configured. Provide OAuth client (GOOGLE_OAUTH_CLIENT_JSON) or service account.")
+    _creds=creds
+    return _creds
+
+def _gs():
+    global _gs_client
+    if _gs_client: return _gs_client
+    creds=_load_creds()
+    _gs_client=gspread.Client(auth=creds)
+    _gs_client.session=gspread.authorize(creds).session
+    return _gs_client
+
+def _calendar():
+    global _cal
+    if _cal: return _cal
+    creds=_load_creds()
+    _cal=build("calendar","v3",credentials=creds, cache_discovery=False)
+    return _cal
+
+def append_form_to_sheet(row:Dict[str,str])->None:
+    if not GOOGLE_SHEET_ID: return
+    client=_gs()
+    sh=client.open_by_key(GOOGLE_SHEET_ID)
+    try:
+        ws=sh.worksheet(SHEET_WORKSHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws=sh.add_worksheet(title=SHEET_WORKSHEET_NAME, rows=1000, cols=20)
+        ws.append_row(["Timestamp","User ID","Username","Full Name","Position","Ship Type","Experience","Questions","Email","Telegram"])
+    values=[
+        datetime.utcnow().isoformat(timespec="seconds")+"Z",
+        row.get("user_id",""),
+        row.get("username",""),
+        row.get("full_name",""),
+        row.get("position",""),
+        row.get("ship_type",""),
+        row.get("experience",""),
+        row.get("questions",""),
+        row.get("email",""),
+        row.get("telegram",""),
+    ]
+    ws.append_row(values)
+
+def _overlap(a_start,a_end,b_start,b_end)->bool:
+    return not (a_end<=b_start or b_end<=a_start)
+
+def available_slots_from_calendar(days:int=7):
+    if not (USE_GOOGLE_CALENDAR and GOOGLE_CALENDAR_ID):
+        return []
+    tz=pytz.timezone(TZ)
+    now=datetime.now(tz)
+    # Build candidate starts
+    candidates=[]
+    start_date=now.date()
+    for d in range(days):
+        day=start_date+timedelta(days=d)
+        for t in SLOTS_LOCAL:
+            dt=tz.localize(datetime.combine(day,t))
+            if dt>now: candidates.append(dt)
+    if not candidates: return []
+    time_min=candidates[0].astimezone(pytz.UTC).isoformat()
+    time_max=(candidates[-1]+timedelta(minutes=MEETING_DURATION_MIN)).astimezone(pytz.UTC).isoformat()
+    cal=_calendar()
+    fb=cal.freebusy().query(body={"timeMin":time_min,"timeMax":time_max,"timeZone":TZ,"items":[{"id":GOOGLE_CALENDAR_ID}]}).execute()
+    busy=fb.get("calendars",{}).get(GOOGLE_CALENDAR_ID,{}).get("busy",[])
+    busy_intervals=[]
+    for b in busy:
+        bs=datetime.fromisoformat(b["start"].replace("Z","+00:00")).astimezone(tz)
+        be=datetime.fromisoformat(b["end"].replace("Z","+00:00")).astimezone(tz)
+        busy_intervals.append((bs,be))
+    ok=[]
+    dur=timedelta(minutes=MEETING_DURATION_MIN)
+    for start in candidates:
+        end=start+dur
+        if not any(_overlap(start,end,b0,b1) for (b0,b1) in busy_intervals):
+            ok.append(start)
+    return ok
+
+import aiosqlite
+from typing import Optional, Tuple
+
+DB_PATH='bot.db'
+
+SCHEMA='''
+CREATE TABLE IF NOT EXISTS users(
+ user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, last_name TEXT, created_at TEXT);
+CREATE TABLE IF NOT EXISTS forms(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT, email TEXT, phone TEXT, topic TEXT, created_at TEXT,
+ FOREIGN KEY(user_id) REFERENCES users(user_id));
+CREATE TABLE IF NOT EXISTS bookings(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, slot_iso TEXT UNIQUE, status TEXT, created_at TEXT,
+ FOREIGN KEY(user_id) REFERENCES users(user_id));
+'''
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript(SCHEMA)
+        await db.commit()
+async def upsert_user(user_id:int, username:str, first_name:str, last_name:str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO users(user_id, username, first_name, last_name, created_at) VALUES(?,?,?,?,datetime('now')) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name, last_name=excluded.last_name",(user_id,username,first_name,last_name))
+        await db.commit()
+async def save_form(user_id:int, name:str, email:str, phone:str, topic:str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO forms(user_id, name, email, phone, topic, created_at) VALUES(?,?,?,?,?,datetime('now'))",(user_id,name,email,phone,topic))
+        await db.commit()
+async def is_slot_taken(slot_iso:str)->bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM bookings WHERE slot_iso=? AND status!='cancelled'",(slot_iso,)) as cur:
+            row=await cur.fetchone(); return row is not None
+async def reserve_slot(user_id:int, slot_iso:str)->int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO bookings(user_id, slot_iso, status, created_at) VALUES(?,?, 'reserved', datetime('now'))",(user_id,slot_iso))
+        await db.commit()
+        async with db.execute("SELECT last_insert_rowid()") as cur:
+            row=await cur.fetchone(); return int(row[0])
+async def mark_paid(booking_id:int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE bookings SET status='paid' WHERE id=?",(booking_id,)); await db.commit()
+async def latest_reserved_booking(user_id:int)->Optional[Tuple[int,str,str]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT id, slot_iso, status FROM bookings WHERE user_id=? ORDER BY id DESC LIMIT 1",(user_id,)) as cur:
+            return await cur.fetchone()
