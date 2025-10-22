@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -31,6 +32,7 @@ from google.oauth2.service_account import Credentials as CCreds
 
 load_dotenv()
 
+# ===== ENV =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
@@ -49,12 +51,15 @@ GCAL_CALENDAR_ID = os.getenv("GCAL_CALENDAR_ID", "primary")
 
 assert BOT_TOKEN and DATABASE_URL and BASE_URL, "Required env missing"
 
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+# ===== AIROGRAM =====
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+# ===== DB =====
 engine = create_async_engine(DATABASE_URL, echo=False, future=True)
 Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
-# --------- Texts ---------
+# ===== TEXTS =====
 WELCOME = (
     "👋 Привет! Добро пожаловать. Этот бот поможет быстро записаться на консультацию — просто отвечай на его вопросы.\n\n"
     "⏱ Продолжительность: 45 минут.\n"
@@ -63,11 +68,13 @@ WELCOME = (
     "До скорой встречи!"
 )
 
-# --------- Google Sheets ---------
+# ===== Google Sheets =====
 _sheet = None
 def get_sheet():
     global _sheet
     if _sheet is None:
+        if not GSPREAD_SA_JSON:
+            raise RuntimeError("GSPREAD_SERVICE_ACCOUNT_JSON is not set")
         sa_info = json.loads(GSPREAD_SA_JSON)
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
@@ -91,7 +98,7 @@ def get_sheet():
         _sheet = ws
     return _sheet
 
-# --------- Google Calendar ---------
+# ===== Google Calendar =====
 _gcal = None
 def get_calendar():
     global _gcal
@@ -108,18 +115,21 @@ def to_rfc3339(dt_utc: datetime) -> str:
     # Ensure UTC Zulu format
     return dt_utc.replace(tzinfo=tz.UTC).isoformat().replace("+00:00", "Z")
 
-async def create_calendar_event(start_utc: datetime, end_utc: datetime, summary: str, description: str) -> Optional[str]:
-    service = get_calendar()
-    event = {
-        "summary": summary,
-        "description": description,
-        "start": {"dateTime": to_rfc3339(start_utc), "timeZone": "UTC"},
-        "end": {"dateTime": to_rfc3339(end_utc), "timeZone": "UTC"},
-    }
-    created = service.events().insert(calendarId=GCAL_CALENDAR_ID, body=event).execute()
-    return created.get("id")
+def create_calendar_event_sync(start_utc, end_utc, summary, description):
+    try:
+        service = get_calendar()
+        ev = {
+            "summary": summary,
+            "description": description,
+            "start": {"dateTime": to_rfc3339(start_utc), "timeZone": "UTC"},
+            "end": {"dateTime": to_rfc3339(end_utc), "timeZone": "UTC"},
+        }
+        created = service.events().insert(calendarId=GCAL_CALENDAR_ID, body=ev).execute()
+        return created.get("id")
+    except Exception:
+        return ""
 
-# --------- FSM ---------
+# ===== FSM =====
 class Form(StatesGroup):
     name = State()
     tg_username = State()
@@ -131,7 +141,7 @@ class Form(StatesGroup):
     waiting_slot = State()
     payment_method = State()
 
-# --------- Utils ---------
+# ===== UTIL =====
 def human_dt(dt_utc: datetime) -> str:
     tzinfo = tz.gettz(TZ)
     return dt_utc.astimezone(tzinfo).strftime("%d %b %Y, %H:%M")
@@ -170,7 +180,7 @@ async def ensure_user(session: AsyncSession, tg_id: int, username: Optional[str]
     uid = (await session.execute(ins, {"tg": tg_id, "un": username})).scalar_one()
     return uid
 
-# --------- Handlers ---------
+# ===== HANDLERS =====
 @dp.message(CommandStart())
 async def on_start(m: Message, state: FSMContext):
     async with Session() as s:
@@ -269,7 +279,12 @@ async def choose_slot(cq: CallbackQuery, state: FSMContext):
         await s.commit()
     if slot_row:
         start_utc, end_utc = slot_row
-        await state.update_data(slot_start_local=human_dt(start_utc), slot_end_local=human_dt(end_utc), slot_start_utc=start_utc, slot_end_utc=end_utc)
+        await state.update_data(
+            slot_start_local=human_dt(start_utc),
+            slot_end_local=human_dt(end_utc),
+            slot_start_utc=start_utc,
+            slot_end_utc=end_utc
+        )
     await state.set_state(Form.payment_method)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🇷🇺 Картой из РФ", callback_data="pay:ru")],
@@ -283,10 +298,9 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
     pm = "Карта РФ" if cq.data.endswith("ru") else "Иностранная карта"
     data = await state.update_data(payment_method=pm)
 
-    # ---- запись в Google Sheets ----
+    # Создаём событие в Google Calendar (UTC) — в пуле потоков, чтобы не блокировать loop
     gcal_event_id = ""
     try:
-        # Создаём событие в Google Calendar (UTC)
         start_utc = data.get("slot_start_utc")
         end_utc = data.get("slot_end_utc")
         if start_utc and end_utc:
@@ -299,7 +313,8 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
                 f"Контакт: {data.get('phone') or '-'}\n"
                 f"Способ оплаты: {data.get('payment_method')}"
             )
-            gcal_event_id = await asyncio.get_event_loop().run_in_executor(
+            loop = asyncio.get_event_loop()
+            gcal_event_id = await loop.run_in_executor(
                 None, lambda: create_calendar_event_sync(start_utc, end_utc, summary, description)
             )
     except Exception as e:
@@ -309,6 +324,7 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
             except Exception:
                 pass
 
+    # Пишем в Google Sheets
     try:
         ws = get_sheet()
         now = datetime.utcnow().isoformat()
@@ -334,6 +350,7 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
             except Exception:
                 pass
 
+    # Уведомление
     summary_msg = (
         "🆕 Заявка на консультацию\n"
         f"Имя: <b>{data.get('name')}</b>\n"
@@ -357,22 +374,7 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
     await cq.message.answer("Спасибо! Заявка сохранена. Я свяжусь с вами для подтверждения. 🙌")
     await cq.answer()
 
-# helper to run sync calendar creation in executor
-def create_calendar_event_sync(start_utc, end_utc, summary, description):
-    try:
-        service = get_calendar()
-        ev = {
-            "summary": summary,
-            "description": description,
-            "start": {"dateTime": start_utc.replace(tzinfo=tz.UTC).isoformat().replace("+00:00", "Z"), "timeZone": "UTC"},
-            "end": {"dateTime": end_utc.replace(tzinfo=tz.UTC).isoformat().replace("+00:00", "Z"), "timeZone": "UTC"},
-        }
-        created = service.events().insert(calendarId=GCAL_CALENDAR_ID, body=ev).execute()
-        return created.get("id")
-    except Exception as e:
-        return ""
-
-# ---- Admin ----
+# ===== Admin =====
 @dp.message(Command("admin"))
 async def admin_menu(m: Message):
     if m.from_user.id not in ADMIN_IDS:
@@ -404,7 +406,7 @@ async def addslot(m: Message):
         await s.commit()
     await m.answer(f"Слот добавлен: {dt_local.strftime('%d %b %Y, %H:%M')} ({SLOT_MINUTES} мин)")
 
-# ---- Webhook ----
+# ===== Webhook =====
 async def on_startup():
     await bot.set_webhook(url=f"{BASE_URL}/webhook", allowed_updates=["message","callback_query"])
 
