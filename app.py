@@ -87,7 +87,12 @@ try:
     u = urlparse(DATABASE_URL or "")
     print("DB scheme:", u.scheme if u else "EMPTY")
     print("DB host:", u.hostname if u else "EMPTY")
-    print("DB ssl?","ssl=" in (DATABASE_URL or ""))
+    from urllib.parse import urlparse, parse_qsl
+u = urlparse(DATABASE_URL or "")
+q = dict(parse_qsl(u.query or "", keep_blank_values=True))
+ssl_flag = ("ssl" in q and q["ssl"] in ("true", "1")) or (q.get("sslmode") in {"require","verify-ca","verify-full"})
+print("DB ssl?", ssl_flag, "| sslmode:", q.get("sslmode"))
+
 except Exception as e:
     print("urlparse failed:", e)
 print("GSPREAD_SHEET_ID set:", bool(GSPREAD_SHEET_ID))
