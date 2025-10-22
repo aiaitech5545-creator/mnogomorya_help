@@ -33,16 +33,38 @@ def mask_token(t: str, keep=8):
     return t[:keep] + "..." + t[-4:] if len(t) > keep+4 else t
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-# Normalize for asyncpg
-_raw_db_url = DATABASE_URL or ""
-if _raw_db_url.startswith("postgres://"):
-    _raw_db_url = _raw_db_url.replace("postgres://", "postgresql+asyncpg://", 1)
-elif _raw_db_url.startswith("postgresql://") and "+asyncpg" not in _raw_db_url:
-    _raw_db_url = _raw_db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
-if _raw_db_url and "ssl=" not in _raw_db_url:
-    _raw_db_url += ("?ssl=true" if "?" not in _raw_db_url else "&ssl=true")
-DATABASE_URL = _raw_db_url
+DATABASE_URL = os.getenv("DATABASE_URL") or ""
+# --- Normalize DB URL for SQLAlchemy + asyncpg ---
+_raw = DATABASE_URL
+
+# 1) приводим схему к asyncpg
+if _raw.startswith("postgres://"):
+    _raw = _raw.replace("postgres://", "postgresql+asyncpg://", 1)
+elif _raw.startswith("postgresql://") and "+asyncpg" not in _raw:
+    _raw = _raw.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+# 2) убираем ошибочные параметры из прошлых правок
+#    (чтобы не было ssl=true или sslmode=true)
+if "ssl=true" in _raw:
+    _raw = _raw.replace("ssl=true", "")
+if "sslmode=true" in _raw:
+    _raw = _raw.replace("sslmode=true", "")
+
+# 3) если нет корректного sslmode — добавляем require
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+u = urlparse(_raw)
+q = dict(parse_qsl(u.query, keep_blank_values=True))
+
+# если уже есть sslmode, но с некорректным значением — заменим на require
+valid_modes = {"disable","allow","prefer","require","verify-ca","verify-full"}
+if "sslmode" not in q or q.get("sslmode") not in valid_modes:
+    q["sslmode"] = "require"
+
+# собираем обратно
+_raw = urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
+
+DATABASE_URL = _raw
+
 
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 TZ = os.getenv("TZ", "Europe/Stockholm")
