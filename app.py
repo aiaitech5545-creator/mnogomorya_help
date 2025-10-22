@@ -34,7 +34,7 @@ def mask_token(t: str, keep=8):
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL") or ""
-# --- Normalize DB URL for SQLAlchemy + asyncpg ---
+# --- Normalize DB URL for SQLAlchemy + asyncpg + SSL ---
 _raw = DATABASE_URL
 
 # 1) приводим схему к asyncpg
@@ -43,27 +43,22 @@ if _raw.startswith("postgres://"):
 elif _raw.startswith("postgresql://") and "+asyncpg" not in _raw:
     _raw = _raw.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-# 2) убираем ошибочные параметры из прошлых правок
-#    (чтобы не было ssl=true или sslmode=true)
-if "ssl=true" in _raw:
-    _raw = _raw.replace("ssl=true", "")
-if "sslmode=true" in _raw:
-    _raw = _raw.replace("sslmode=true", "")
+# 2) убираем следы прошлых правок
+for bad in ("ssl=true", "sslmode=true"):
+    if bad in _raw:
+        _raw = _raw.replace(bad, "")
 
-# 3) если нет корректного sslmode — добавляем require
+# 3) гарантируем sslmode=require
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 u = urlparse(_raw)
 q = dict(parse_qsl(u.query, keep_blank_values=True))
-
-# если уже есть sslmode, но с некорректным значением — заменим на require
 valid_modes = {"disable","allow","prefer","require","verify-ca","verify-full"}
 if "sslmode" not in q or q.get("sslmode") not in valid_modes:
     q["sslmode"] = "require"
-
-# собираем обратно
 _raw = urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
 
 DATABASE_URL = _raw
+
 
 
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
