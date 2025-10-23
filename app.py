@@ -59,6 +59,28 @@ if DATABASE_URL.startswith("postgres://"):
 if "sslmode" not in DATABASE_URL:
     DATABASE_URL += "?sslmode=require"
 
+# --- Normalize DATABASE_URL for SQLAlchemy + asyncpg (жёсткая версия) ---
+import re
+_raw = os.getenv("DATABASE_URL", "")
+
+# 1) схема под asyncpg
+if _raw.startswith("postgres://"):
+    _raw = _raw.replace("postgres://", "postgresql+asyncpg://", 1)
+elif _raw.startswith("postgresql://") and "+asyncpg" not in _raw:
+    _raw = _raw.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+# 2) вырезаем sslmode=... где бы он ни был (и чистим лишние ?/&)
+_raw = re.sub(r'([?&])sslmode=[^&]*(&)?', lambda m: (m.group(1) if m.group(2) else ''), _raw)
+_raw = _raw.replace('?&', '?').rstrip('?').rstrip('&')
+
+# 3) добавляем ssl=true, если его нет
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+u = urlparse(_raw)
+q = dict(parse_qsl(u.query or "", keep_blank_values=True))
+if q.get("ssl") not in ("true", "1"):
+    q["ssl"] = "true"
+DATABASE_URL = urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
+
 engine = create_async_engine(DATABASE_URL, echo=False, future=True)
 Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
