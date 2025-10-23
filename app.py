@@ -5,7 +5,7 @@ import json
 import asyncio
 from typing import Optional, List
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -91,19 +91,25 @@ if not DATABASE_URL_ENV:
 import socket
 
 def normalize_database_url(raw: str) -> str:
-    """Ensure URL uses asyncpg and enforces SSL mode required."""
+    """
+    Приводим URL к asyncpg и удаляем sslmode/ssl* параметры, потому что для asyncpg
+    SSL включаем через connect_args={'ssl': True}.
+    """
     if not raw:
         return raw
     # postgres:// → postgresql+asyncpg://
     if raw.startswith("postgres://"):
         raw = "postgresql+asyncpg://" + raw[len("postgres://"):]
-    # postgresql:// → postgresql+asyncpg:// (if needed)
+    # postgresql:// → postgresql+asyncpg:// (если нужно)
     if raw.startswith("postgresql://") and "+asyncpg" not in raw:
         raw = raw.replace("postgresql://", "postgresql+asyncpg://", 1)
-    # Enforce sslmode=require
-    if "sslmode=" not in raw:
-        sep = "&" if "?" in raw else "?"
-        raw = f"{raw}{sep}sslmode=require"
+    # Удаляем sslmode/ssl* из query
+    u = urlparse(raw)
+    q = dict(parse_qsl(u.query or "", keep_blank_values=True))
+    for k in list(q.keys()):
+        if k.lower().startswith("ssl"):
+            q.pop(k, None)
+    raw = urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
     return raw
 
 def debug_db_dns(url: str):
@@ -131,7 +137,7 @@ engine = create_async_engine(
     echo=False,
     future=True,
     pool_pre_ping=True,
-    connect_args={"ssl": True}
+    connect_args={"ssl": True}  # SSL для asyncpg
 )
 Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
