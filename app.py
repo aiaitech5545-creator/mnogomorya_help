@@ -2,6 +2,7 @@
 import os
 import sys
 import json
+import ssl
 import asyncio
 from typing import Optional, List
 from datetime import datetime, timedelta
@@ -93,7 +94,7 @@ import socket
 def normalize_database_url(raw: str) -> str:
     """
     Приводим URL к asyncpg и удаляем sslmode/ssl* параметры, потому что для asyncpg
-    SSL включаем через connect_args={'ssl': True}.
+    SSL включаем через connect_args с SSLContext.
     """
     if not raw:
         return raw
@@ -132,12 +133,18 @@ debug_db_dns(DATABASE_URL)
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+# Railway PG прокси: нужен TLS, но цепочка может быть self-signed.
+# Создаём SSL-контекст без проверки сертификата (аналог sslmode=require для psycopg).
+SSL_CTX = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode = ssl.CERT_NONE
+
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
     future=True,
     pool_pre_ping=True,
-    connect_args={"ssl": True}  # SSL для asyncpg
+    connect_args={"ssl": SSL_CTX}
 )
 Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
