@@ -1,9 +1,9 @@
-
 import os
 import sys
 import json
 import ssl
 import asyncio
+import socket
 from typing import Optional, List
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
@@ -45,7 +45,6 @@ def mask_token(t: str, keep=8):
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATABASE_URL_ENV = os.getenv("DATABASE_URL", "")
 BASE_URL = os.getenv("BASE_URL", "")
-# ADMIN_IDS is a comma-separated list of integers
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 TZ_NAME = os.getenv("TZ", "Europe/Stockholm")
 SLOT_MINUTES = int(os.getenv("SLOT_MINUTES", "60"))
@@ -87,31 +86,25 @@ if not DATABASE_URL_ENV:
     raise RuntimeError("DATABASE_URL отсутствует (подключи PostgreSQL на Railway).")
 
 # =========================
-# DB DEBUG / NORMALIZE (single source of truth)
+# DB DEBUG / NORMALIZE
 # =========================
-import socket
-
 def normalize_database_url(raw: str) -> str:
     """
-    Приводим URL к asyncpg и удаляем sslmode/ssl* параметры, потому что для asyncpg
-    SSL включаем через connect_args с SSLContext.
+    Приводим URL к asyncpg и убираем все ssl* параметры из query,
+    потому что SSL задаём через connect_args с SSLContext.
     """
     if not raw:
         return raw
-    # postgres:// → postgresql+asyncpg://
     if raw.startswith("postgres://"):
         raw = "postgresql+asyncpg://" + raw[len("postgres://"):]
-    # postgresql:// → postgresql+asyncpg:// (если нужно)
     if raw.startswith("postgresql://") and "+asyncpg" not in raw:
         raw = raw.replace("postgresql://", "postgresql+asyncpg://", 1)
-    # Удаляем sslmode/ssl* из query
     u = urlparse(raw)
     q = dict(parse_qsl(u.query or "", keep_blank_values=True))
     for k in list(q.keys()):
         if k.lower().startswith("ssl"):
             q.pop(k, None)
-    raw = urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
-    return raw
+    return urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
 
 def debug_db_dns(url: str):
     p = urlparse(url)
@@ -133,8 +126,7 @@ debug_db_dns(DATABASE_URL)
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# Railway PG прокси: нужен TLS, но цепочка может быть self-signed.
-# Создаём SSL-контекст без проверки сертификата (аналог sslmode=require для psycopg).
+# Railway PG proxy: нужен TLS, цепочка может быть self-signed
 SSL_CTX = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
@@ -144,7 +136,7 @@ engine = create_async_engine(
     echo=False,
     future=True,
     pool_pre_ping=True,
-    connect_args={"ssl": SSL_CTX}
+    connect_args={"ssl": SSL_CTX},
 )
 Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
@@ -160,31 +152,38 @@ async def _db_self_test():
 # =========================
 # DB schema init (ensure tables)
 # =========================
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS users (
-  id SERIAL PRIMARY KEY,
-  tg_id BIGINT UNIQUE NOT NULL,
-  username TEXT
-);
-CREATE TABLE IF NOT EXISTS slots (
-  id SERIAL PRIMARY KEY,
-  start_utc TIMESTAMPTZ NOT NULL,
-  end_utc   TIMESTAMPTZ NOT NULL,
-  is_booked BOOLEAN NOT NULL DEFAULT false
-);
-CREATE TABLE IF NOT EXISTS bookings (
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  slot_id INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
-  status  TEXT NOT NULL DEFAULT 'requested',
-  paid    BOOLEAN NOT NULL DEFAULT false
-);
-"""
+SCHEMA_STMTS = [
+    """
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      tg_id BIGINT UNIQUE NOT NULL,
+      username TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS slots (
+      id SERIAL PRIMARY KEY,
+      start_utc TIMESTAMPTZ NOT NULL,
+      end_utc   TIMESTAMPTZ NOT NULL,
+      is_booked BOOLEAN NOT NULL DEFAULT false
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS bookings (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      slot_id INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
+      status  TEXT NOT NULL DEFAULT 'requested',
+      paid    BOOLEAN NOT NULL DEFAULT false
+    )
+    """,
+]
 
 async def _db_init_schema():
     try:
         async with engine.begin() as conn:
-            await conn.execute(text(SCHEMA_SQL))
+            for stmt in SCHEMA_STMTS:
+                await conn.execute(text(stmt))
         print("DB INIT: OK (schema ensured)")
     except Exception as e:
         print("DB INIT: FAILED ->", repr(e))
