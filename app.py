@@ -1,11 +1,11 @@
+
 import os
 import sys
-import re
 import json
 import asyncio
 from typing import Optional, List
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -23,16 +23,16 @@ from sqlalchemy import text
 from dateutil import tz
 from dotenv import load_dotenv
 
-# Google Sheets
+# Google Sheets (optional)
 import gspread
 from google.oauth2.service_account import Credentials as SheetsCreds
 
-# Google Calendar
+# Google Calendar (optional)
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials as CalCreds
 
 # =========================
-# ENV & DIAG
+# ENV & BASIC DIAG
 # =========================
 load_dotenv()
 
@@ -44,11 +44,12 @@ def mask_token(t: str, keep=8):
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATABASE_URL_ENV = os.getenv("DATABASE_URL", "")
 BASE_URL = os.getenv("BASE_URL", "")
+# ADMIN_IDS is a comma-separated list of integers
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 TZ_NAME = os.getenv("TZ", "Europe/Stockholm")
 SLOT_MINUTES = int(os.getenv("SLOT_MINUTES", "60"))
 PRICE_USD = os.getenv("PRICE_USD", "75")
-SKIP_AUTO_WEBHOOK = os.getenv("SKIP_AUTO_WEBHOOK", "1") == "1"  # по умолчанию не трогаем вебхук
+SKIP_AUTO_WEBHOOK = os.getenv("SKIP_AUTO_WEBHOOK", "1") in ("1", "true", "True")
 
 # Google Sheets
 GSPREAD_SA_JSON = os.getenv("GSPREAD_SERVICE_ACCOUNT_JSON", "")
@@ -58,25 +59,6 @@ GSPREAD_SHEET_ID = os.getenv("GSPREAD_SHEET_ID", "")
 GCAL_SA_JSON = os.getenv("GCAL_SERVICE_ACCOUNT_JSON", GSPREAD_SA_JSON or "")
 GCAL_CALENDAR_ID = os.getenv("GCAL_CALENDAR_ID", "primary")
 
-# --- Normalize DATABASE_URL for SQLAlchemy + asyncpg (bulletproof) ---
-_raw = DATABASE_URL_ENV or ""
-if _raw.startswith("postgres://"):
-    _raw = _raw.replace("postgres://", "postgresql+asyncpg://", 1)
-elif _raw.startswith("postgresql://") and "+asyncpg" not in _raw:
-    _raw = _raw.replace("postgresql://", "postgresql+asyncpg://", 1)
-
-# вырезаем любые sslmode и прочие ssl-параметры из URL (они для psycopg, ломают asyncpg)
-_raw = re.sub(r'([?&])sslmode=[^&]*(&)?', lambda m: (m.group(1) if m.group(2) else ''), _raw)
-_raw = _raw.replace('?&', '?').rstrip('?').rstrip('&')
-
-u = urlparse(_raw)
-q = dict(parse_qsl(u.query or "", keep_blank_values=True))
-for k in list(q.keys()):
-    if k.lower().startswith("ssl"):
-        q.pop(k, None)
-DATABASE_URL = urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
-
-# --- DIAG ---
 print("==== DIAG: startup ====")
 print("Python:", sys.version)
 try:
@@ -86,11 +68,11 @@ except Exception:
     print("Aiogram: unknown")
 print("BOT_TOKEN:", mask_token(BOT_TOKEN))
 print("BASE_URL:", BASE_URL or "EMPTY")
-print("DATABASE_URL set:", bool(DATABASE_URL))
+print("DATABASE_URL set:", bool(DATABASE_URL_ENV))
 try:
-    u = urlparse(DATABASE_URL or "")
-    print("DB scheme:", u.scheme or "EMPTY")
-    print("DB host:", u.hostname or "EMPTY")
+    u0 = urlparse(DATABASE_URL_ENV or "")
+    print("DB scheme(raw):", u0.scheme or "EMPTY")
+    print("DB host(raw):", u0.hostname or "EMPTY")
 except Exception as e:
     print("DIAG urlparse failed:", e)
 print("GSPREAD_SHEET_ID set:", bool(GSPREAD_SHEET_ID))
@@ -100,16 +82,50 @@ print("========================")
 
 if not BOT_TOKEN or ":" not in BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN отсутствует или неверен (получи у @BotFather).")
-if not DATABASE_URL:
+if not DATABASE_URL_ENV:
     raise RuntimeError("DATABASE_URL отсутствует (подключи PostgreSQL на Railway).")
 
 # =========================
-# Aiogram & DB
+# DB DEBUG / NORMALIZE (single source of truth)
+# =========================
+import socket
+
+def normalize_database_url(raw: str) -> str:
+    """Ensure URL uses asyncpg and enforces SSL mode required."""
+    if not raw:
+        return raw
+    # postgres:// → postgresql+asyncpg://
+    if raw.startswith("postgres://"):
+        raw = "postgresql+asyncpg://" + raw[len("postgres://"):]
+    # postgresql:// → postgresql+asyncpg:// (if needed)
+    if raw.startswith("postgresql://") and "+asyncpg" not in raw:
+        raw = raw.replace("postgresql://", "postgresql+asyncpg://", 1)
+    # Enforce sslmode=require
+    if "sslmode=" not in raw:
+        sep = "&" if "?" in raw else "?"
+        raw = f"{raw}{sep}sslmode=require"
+    return raw
+
+def debug_db_dns(url: str):
+    p = urlparse(url)
+    host, port = p.hostname, p.port
+    print(f"[DB DEBUG] URL={url}")
+    print(f"[DB DEBUG] HOST={host} PORT={port}")
+    try:
+        ip = socket.gethostbyname(host)
+        print(f"[DB DEBUG] DNS OK -> {host} -> {ip}")
+    except Exception as e:
+        print(f"[DB DEBUG] DNS FAIL for {host}: {e}")
+
+DATABASE_URL = normalize_database_url(DATABASE_URL_ENV)
+debug_db_dns(DATABASE_URL)
+
+# =========================
+# Aiogram & DB engine/session
 # =========================
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# принудительно включаем SSL для asyncpg (без sslmode/ssl в URL)
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
@@ -129,6 +145,39 @@ async def _db_self_test():
         raise
 
 # =========================
+# DB schema init (ensure tables)
+# =========================
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+  id SERIAL PRIMARY KEY,
+  tg_id BIGINT UNIQUE NOT NULL,
+  username TEXT
+);
+CREATE TABLE IF NOT EXISTS slots (
+  id SERIAL PRIMARY KEY,
+  start_utc TIMESTAMPTZ NOT NULL,
+  end_utc   TIMESTAMPTZ NOT NULL,
+  is_booked BOOLEAN NOT NULL DEFAULT false
+);
+CREATE TABLE IF NOT EXISTS bookings (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  slot_id INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
+  status  TEXT NOT NULL DEFAULT 'requested',
+  paid    BOOLEAN NOT NULL DEFAULT false
+);
+"""
+
+async def _db_init_schema():
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(SCHEMA_SQL))
+        print("DB INIT: OK (schema ensured)")
+    except Exception as e:
+        print("DB INIT: FAILED ->", repr(e))
+        raise
+
+# =========================
 # UI texts
 # =========================
 WELCOME = (
@@ -140,11 +189,10 @@ WELCOME = (
 )
 
 # =========================
-# Google Sheets
+# Google Sheets (lazy init)
 # =========================
 _sheet = None
 def get_sheet():
-    """Ленивая инициализация; не вызывается, если переменные не заданы."""
     global _sheet
     if _sheet is None:
         if not GSPREAD_SA_JSON or not GSPREAD_SHEET_ID:
@@ -173,11 +221,10 @@ def get_sheet():
     return _sheet
 
 # =========================
-# Google Calendar
+# Google Calendar (lazy init)
 # =========================
 _gcal = None
 def get_calendar():
-    """Ленивая инициализация; не вызывается, если переменные не заданы."""
     global _gcal
     if _gcal is None:
         if not GCAL_SA_JSON:
@@ -333,7 +380,8 @@ async def show_slots(target: Message):
         row.append(InlineKeyboardButton(text=text_btn, callback_data=f"slot:{sl['id']}"))
         if i % 2 == 0:
             rows.append(row); row = []
-    if row: rows.append(row)
+    if row:
+        rows.append(row)
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await target.answer("Выберите удобное время:", reply_markup=kb)
 
@@ -341,7 +389,6 @@ async def show_slots(target: Message):
 async def choose_slot(cq: CallbackQuery, state: FSMContext):
     slot_id = int(cq.data.split(":")[1])
     async with Session() as s:
-        # проверяем и резервируем
         slot_row = (await s.execute(text("SELECT start_utc, end_utc FROM slots WHERE id=:id"), {"id": slot_id})).first()
         upd = await s.execute(text("UPDATE slots SET is_booked = true WHERE id=:id AND is_booked=false RETURNING id"), {"id": slot_id})
         if not upd.first():
@@ -368,7 +415,7 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
     pm = "Карта РФ" if cq.data.endswith("ru") else "Иностранная карта"
     data = await state.update_data(payment_method=pm)
 
-    # Calendar (синхронный вызов в отдельном потоке)
+    # Calendar (sync API in thread)
     gcal_event_id = ""
     try:
         start_utc = data.get("slot_start_utc")
@@ -390,7 +437,7 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
     except Exception as e:
         print("WARN: Calendar creation failed:", e)
 
-    # Sheets (если настроено)
+    # Sheets append (optional)
     try:
         if GSPREAD_SA_JSON and GSPREAD_SHEET_ID:
             ws = get_sheet()
@@ -417,7 +464,7 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
     await cq.message.answer("Спасибо! Заявка сохранена. Я свяжусь с вами для подтверждения. 🙌")
     await cq.answer()
 
-# ---- Админ
+# ---- Admin
 @dp.message(Command("admin"))
 async def admin_menu(m: Message):
     if m.from_user.id not in ADMIN_IDS:
@@ -454,6 +501,7 @@ async def addslot(m: Message):
 # =========================
 async def on_startup():
     await _db_self_test()
+    await _db_init_schema()
     if SKIP_AUTO_WEBHOOK:
         print("INFO: SKIP_AUTO_WEBHOOK=1 — пропускаю setWebhook (поставь вручную через Telegram API).")
         return
