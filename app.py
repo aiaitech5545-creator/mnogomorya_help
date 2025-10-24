@@ -5,7 +5,7 @@ import ssl
 import asyncio
 import socket
 from typing import Optional, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from aiogram import Bot, Dispatcher, F
@@ -50,6 +50,12 @@ TZ_NAME = os.getenv("TZ", "Europe/Stockholm")
 SLOT_MINUTES = int(os.getenv("SLOT_MINUTES", "60"))
 PRICE_USD = os.getenv("PRICE_USD", "75")
 SKIP_AUTO_WEBHOOK = os.getenv("SKIP_AUTO_WEBHOOK", "1") in ("1", "true", "True")
+
+# Автосоздание слотов: сколько дней вперёд генерировать
+AUTO_SLOTS_DAYS_AHEAD = int(os.getenv("AUTO_SLOTS_DAYS_AHEAD", "30"))
+# Рабочие часы (в локальной зоне TZ_NAME)
+WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "13"))
+WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "17"))  # не включая 17:00 в конец диапазона для стартов слотов
 
 # Google Sheets
 GSPREAD_SA_JSON = os.getenv("GSPREAD_SERVICE_ACCOUNT_JSON", "")
@@ -168,6 +174,11 @@ SCHEMA_STMTS = [
       is_booked BOOLEAN NOT NULL DEFAULT false
     )
     """,
+    # уникальный индекс, чтобы не было дублей одного и того же слота
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_slots_start_utc_unique
+    ON slots(start_utc)
+    """,
     """
     CREATE TABLE IF NOT EXISTS bookings (
       id SERIAL PRIMARY KEY,
@@ -188,6 +199,60 @@ async def _db_init_schema():
     except Exception as e:
         print("DB INIT: FAILED ->", repr(e))
         raise
+
+# =========================
+# AUTO-SLOTS (weekdays 13:00–17:00 local)
+# =========================
+def _localize(dt_naive: datetime) -> datetime:
+    tzinfo = tz.gettz(TZ_NAME)
+    return dt_naive.replace(tzinfo=tzinfo)
+
+def _to_utc(dt_local: datetime) -> datetime:
+    return dt_local.astimezone(tz.UTC)
+
+def _is_weekday(d: date) -> bool:
+    # Monday=0 ... Sunday=6
+    return d.weekday() < 5
+
+async def ensure_slots_for_range(days_ahead: int):
+    """Создаёт слоты на каждый будний день на указанное число дней вперёд."""
+    if days_ahead <= 0:
+        return
+    today_local = datetime.now(tz.gettz(TZ_NAME)).date()
+    last_date = today_local + timedelta(days=days_ahead)
+
+    async with Session() as s:
+        for d in (today_local + timedelta(days=i) for i in range((last_date - today_local).days + 1)):
+            if not _is_weekday(d):
+                continue
+            # Стартовые часы 13,14,15,16 (если SLOT_MINUTES=60)
+            # В общем случае стартовые: WORK_START_HOUR .. WORK_END_HOUR-1
+            for hour in range(WORK_START_HOUR, WORK_END_HOUR):
+                start_local = _localize(datetime(d.year, d.month, d.day, hour, 0, 0))
+                end_local = start_local + timedelta(minutes=SLOT_MINUTES)
+                start_utc = _to_utc(start_local)
+                end_utc = _to_utc(end_local)
+                # ON CONFLICT DO NOTHING — благодаря уникальному индексу
+                await s.execute(
+                    text("""
+                        INSERT INTO slots(start_utc, end_utc, is_booked)
+                        VALUES (:s, :e, false)
+                        ON CONFLICT (start_utc) DO NOTHING
+                    """),
+                    {"s": start_utc, "e": end_utc},
+                )
+        await s.commit()
+    print(f"AUTO-SLOTS: ensured next {days_ahead} days (weekdays {WORK_START_HOUR}:00–{WORK_END_HOUR}:00, {SLOT_MINUTES} min).")
+
+async def auto_slots_loop():
+    """Периодически поддерживаем наличие слотов на горизонте days_ahead."""
+    while True:
+        try:
+            await ensure_slots_for_range(AUTO_SLOTS_DAYS_AHEAD)
+        except Exception as e:
+            print("AUTO-SLOTS loop warn:", e)
+        # Проверяем каждые 6 часов
+        await asyncio.sleep(6 * 3600)
 
 # =========================
 # UI texts
@@ -476,14 +541,15 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
     await cq.message.answer("Спасибо! Заявка сохранена. Я свяжусь с вами для подтверждения. 🙌")
     await cq.answer()
 
-# ---- Admin
+# ---- Admin helpers
 @dp.message(Command("admin"))
 async def admin_menu(m: Message):
     if m.from_user.id not in ADMIN_IDS:
         return
     await m.answer(
-        "Админ: /addslot YYYY-MM-DD HH:MM — добавить слот (длительность берётся из SLOT_MINUTES).\n"
-        "Пример: /addslot 2025-10-25 15:00"
+        "Админ команды:\n"
+        "/addslot YYYY-MM-DD HH:MM — добавить один слот\n"
+        "/autofill — сгенерировать слоты на ближайшие дни (AUTO_SLOTS_DAYS_AHEAD)\n"
     )
 
 from dateutil import tz as _tz
@@ -503,10 +569,23 @@ async def addslot(m: Message):
         await m.answer("Неверный формат. Пример: /addslot 2025-10-25 15:00")
         return
     async with Session() as s:
-        await s.execute(text("INSERT INTO slots(start_utc, end_utc, is_booked) VALUES (:s,:e,false)"),
-                        {"s": dt_utc, "e": dt_utc_end})
+        await s.execute(
+            text("""
+                 INSERT INTO slots(start_utc, end_utc, is_booked)
+                 VALUES (:s,:e,false)
+                 ON CONFLICT (start_utc) DO NOTHING
+            """),
+            {"s": dt_utc, "e": dt_utc_end}
+        )
         await s.commit()
     await m.answer(f"Слот добавлен: {dt_local.strftime('%d %b %Y, %H:%M')} ({SLOT_MINUTES} мин)")
+
+@dp.message(Command("autofill"))
+async def cmd_autofill(m: Message):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    await ensure_slots_for_range(AUTO_SLOTS_DAYS_AHEAD)
+    await m.answer(f"Готово! Созданы/проверены слоты на {AUTO_SLOTS_DAYS_AHEAD} дней вперёд (будни {WORK_START_HOUR}:00–{WORK_END_HOUR}:00).")
 
 # =========================
 # Webhook / Server
@@ -514,6 +593,11 @@ async def addslot(m: Message):
 async def on_startup():
     await _db_self_test()
     await _db_init_schema()
+    # Первичная генерация слотов
+    await ensure_slots_for_range(AUTO_SLOTS_DAYS_AHEAD)
+    # Запускаем поддерживающую петлю
+    asyncio.create_task(auto_slots_loop())
+
     if SKIP_AUTO_WEBHOOK:
         print("INFO: SKIP_AUTO_WEBHOOK=1 — пропускаю setWebhook (поставь вручную через Telegram API).")
         return
