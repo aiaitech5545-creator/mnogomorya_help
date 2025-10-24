@@ -32,6 +32,7 @@ from google.oauth2.service_account import Credentials as SheetsCreds
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials as CalCreds
 
+
 # =========================
 # ENV & BASIC DIAG
 # =========================
@@ -51,11 +52,10 @@ SLOT_MINUTES = int(os.getenv("SLOT_MINUTES", "60"))
 PRICE_USD = os.getenv("PRICE_USD", "75")
 SKIP_AUTO_WEBHOOK = os.getenv("SKIP_AUTO_WEBHOOK", "1") in ("1", "true", "True")
 
-# Автосоздание слотов: сколько дней вперёд генерировать
+# Автосоздание слотов
 AUTO_SLOTS_DAYS_AHEAD = int(os.getenv("AUTO_SLOTS_DAYS_AHEAD", "30"))
-# Рабочие часы (в локальной зоне TZ_NAME)
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "13"))
-WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "17"))  # не включая 17:00 в конец диапазона для стартов слотов
+WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "17"))  # последний стартовый час = WORK_END_HOUR-1
 
 # Google Sheets
 GSPREAD_SA_JSON = os.getenv("GSPREAD_SERVICE_ACCOUNT_JSON", "")
@@ -91,13 +91,14 @@ if not BOT_TOKEN or ":" not in BOT_TOKEN:
 if not DATABASE_URL_ENV:
     raise RuntimeError("DATABASE_URL отсутствует (подключи PostgreSQL на Railway).")
 
+
 # =========================
 # DB DEBUG / NORMALIZE
 # =========================
 def normalize_database_url(raw: str) -> str:
     """
-    Приводим URL к asyncpg и убираем все ssl* параметры из query,
-    потому что SSL задаём через connect_args с SSLContext.
+    Приводим URL к asyncpg и убираем ssl* параметры из query,
+    так как SSL задаём через connect_args с SSLContext.
     """
     if not raw:
         return raw
@@ -125,6 +126,7 @@ def debug_db_dns(url: str):
 
 DATABASE_URL = normalize_database_url(DATABASE_URL_ENV)
 debug_db_dns(DATABASE_URL)
+
 
 # =========================
 # Aiogram & DB engine/session
@@ -155,6 +157,7 @@ async def _db_self_test():
         print("DB SELF-TEST: FAILED ->", repr(e))
         raise
 
+
 # =========================
 # DB schema init (ensure tables)
 # =========================
@@ -174,7 +177,7 @@ SCHEMA_STMTS = [
       is_booked BOOLEAN NOT NULL DEFAULT false
     )
     """,
-    # уникальный индекс, чтобы не было дублей одного и того же слота
+    # уникальный индекс, чтобы не было дублей одного и того же времени старта
     """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_slots_start_utc_unique
     ON slots(start_utc)
@@ -199,6 +202,7 @@ async def _db_init_schema():
     except Exception as e:
         print("DB INIT: FAILED ->", repr(e))
         raise
+
 
 # =========================
 # AUTO-SLOTS (weekdays 13:00–17:00 local)
@@ -225,8 +229,6 @@ async def ensure_slots_for_range(days_ahead: int):
         for d in (today_local + timedelta(days=i) for i in range((last_date - today_local).days + 1)):
             if not _is_weekday(d):
                 continue
-            # Стартовые часы 13,14,15,16 (если SLOT_MINUTES=60)
-            # В общем случае стартовые: WORK_START_HOUR .. WORK_END_HOUR-1
             for hour in range(WORK_START_HOUR, WORK_END_HOUR):
                 start_local = _localize(datetime(d.year, d.month, d.day, hour, 0, 0))
                 end_local = start_local + timedelta(minutes=SLOT_MINUTES)
@@ -251,8 +253,8 @@ async def auto_slots_loop():
             await ensure_slots_for_range(AUTO_SLOTS_DAYS_AHEAD)
         except Exception as e:
             print("AUTO-SLOTS loop warn:", e)
-        # Проверяем каждые 6 часов
-        await asyncio.sleep(6 * 3600)
+        await asyncio.sleep(6 * 3600)  # каждые 6 часов
+
 
 # =========================
 # UI texts
@@ -264,6 +266,7 @@ WELCOME = (
     f"💵 Стоимость консультации — ${PRICE_USD}.\n\n"
     "До скорой встречи!"
 )
+
 
 # =========================
 # Google Sheets (lazy init)
@@ -297,6 +300,7 @@ def get_sheet():
         _sheet = ws
     return _sheet
 
+
 # =========================
 # Google Calendar (lazy init)
 # =========================
@@ -313,8 +317,7 @@ def get_calendar():
     return _gcal
 
 def to_rfc3339(dt_utc: datetime) -> str:
-    from dateutil import tz as _tz
-    return dt_utc.replace(tzinfo=_tz.UTC).isoformat().replace("+00:00", "Z")
+    return dt_utc.replace(tzinfo=tz.UTC).isoformat().replace("+00:00", "Z")
 
 def create_calendar_event_sync(start_utc, end_utc, summary, description):
     try:
@@ -331,6 +334,7 @@ def create_calendar_event_sync(start_utc, end_utc, summary, description):
         print("WARN: Calendar insert failed:", e)
         return ""
 
+
 # =========================
 # FSM
 # =========================
@@ -344,6 +348,7 @@ class Form(StatesGroup):
     topic = State()
     waiting_slot = State()
     payment_method = State()
+
 
 # =========================
 # DB helpers
@@ -372,6 +377,7 @@ async def ensure_user(session: AsyncSession, tg_id: int, username: Optional[str]
         {"tg": tg_id, "un": username}
     )).scalar_one()
     return uid
+
 
 # =========================
 # Handlers
@@ -541,6 +547,7 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
     await cq.message.answer("Спасибо! Заявка сохранена. Я свяжусь с вами для подтверждения. 🙌")
     await cq.answer()
 
+
 # ---- Admin helpers
 @dp.message(Command("admin"))
 async def admin_menu(m: Message):
@@ -550,9 +557,8 @@ async def admin_menu(m: Message):
         "Админ команды:\n"
         "/addslot YYYY-MM-DD HH:MM — добавить один слот\n"
         "/autofill — сгенерировать слоты на ближайшие дни (AUTO_SLOTS_DAYS_AHEAD)\n"
+        "/testsheet — записать тестовую строку в Google Sheet\n"
     )
-
-from dateutil import tz as _tz
 
 @dp.message(Command("addslot"))
 async def addslot(m: Message):
@@ -561,9 +567,9 @@ async def addslot(m: Message):
     try:
         parts = m.text.split()
         dt_local = datetime.strptime(parts[1] + " " + parts[2], "%Y-%m-%d %H:%M")
-        local_tz = _tz.gettz(TZ_NAME)
+        local_tz = tz.gettz(TZ_NAME)
         dt_local = dt_local.replace(tzinfo=local_tz)
-        dt_utc = dt_local.astimezone(_tz.UTC)
+        dt_utc = dt_local.astimezone(tz.UTC)
         dt_utc_end = dt_utc + timedelta(minutes=SLOT_MINUTES)
     except Exception:
         await m.answer("Неверный формат. Пример: /addslot 2025-10-25 15:00")
@@ -587,6 +593,18 @@ async def cmd_autofill(m: Message):
     await ensure_slots_for_range(AUTO_SLOTS_DAYS_AHEAD)
     await m.answer(f"Готово! Созданы/проверены слоты на {AUTO_SLOTS_DAYS_AHEAD} дней вперёд (будни {WORK_START_HOUR}:00–{WORK_END_HOUR}:00).")
 
+@dp.message(Command("testsheet"))
+async def testsheet(m: Message):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        ws = get_sheet()
+        ws.append_row(["test", datetime.utcnow().isoformat()])
+        await m.answer("✅ Тестовая строка записана в таблицу.")
+    except Exception as e:
+        await m.answer(f"⚠️ Ошибка Google Sheets: {e}")
+
+
 # =========================
 # Webhook / Server
 # =========================
@@ -595,7 +613,7 @@ async def on_startup():
     await _db_init_schema()
     # Первичная генерация слотов
     await ensure_slots_for_range(AUTO_SLOTS_DAYS_AHEAD)
-    # Запускаем поддерживающую петлю
+    # Фоновая поддержка горизонта слотов
     asyncio.create_task(auto_slots_loop())
 
     if SKIP_AUTO_WEBHOOK:
@@ -624,8 +642,10 @@ async def main():
     app.router.add_get("/", health_handler)
 
     await on_startup()
-    runner = web.AppRunner(app); await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=int(os.getenv("PORT", "8080"))); await site.start()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    await site.start()
     print("Webhook server started")
     while True:
         await asyncio.sleep(3600)
