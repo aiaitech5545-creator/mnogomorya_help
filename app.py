@@ -49,19 +49,19 @@ BASE_URL = os.getenv("BASE_URL", "")
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
 # === Time & slots ===
-TZ_NAME = os.getenv("TZ", "Europe/Amsterdam")  # ускоряем локализацию и унифицируем TZ
+TZ_NAME = os.getenv("TZ", "Europe/Amsterdam")
 SLOT_MINUTES = int(os.getenv("SLOT_MINUTES", "60"))
 PRICE_USD = os.getenv("PRICE_USD", "75")
 SKIP_AUTO_WEBHOOK = os.getenv("SKIP_AUTO_WEBHOOK", "1") in ("1", "true", "True")
 
 # Генерируем и показываем слоты РОВНО на 7 дней вперёд
-AUTO_SLOTS_DAYS_AHEAD = int(os.getenv("AUTO_SLOTS_DAYS_AHEAD", "7"))   # было 30 ⇒ 7
-SHOW_DAYS_AHEAD = int(os.getenv("SHOW_DAYS_AHEAD", "7"))               # оставить 7
+AUTO_SLOTS_DAYS_AHEAD = int(os.getenv("AUTO_SLOTS_DAYS_AHEAD", "7"))
+SHOW_DAYS_AHEAD = int(os.getenv("SHOW_DAYS_AHEAD", "7"))
 SLOTS_DATE_PAGE_SIZE = int(os.getenv("SLOTS_DATE_PAGE_SIZE", "7"))
 
-# Рабочее окно (можно менять через ENV)
-WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "10"))  # локальное время начала
-WORK_END_HOUR   = int(os.getenv("WORK_END_HOUR",   "20"))  # локальное время конца (исключительно)
+# Рабочее окно (локальное время; конец — исключительно)
+WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "10"))
+WORK_END_HOUR   = int(os.getenv("WORK_END_HOUR",   "20"))
 
 # Google Sheets
 GSPREAD_SA_JSON = os.getenv("GSPREAD_SERVICE_ACCOUNT_JSON", "")
@@ -363,7 +363,7 @@ def create_calendar_event_sync(start_utc, end_utc, summary, description):
 
 
 # =========================
-# FSM
+# FSM (единое объявление)
 # =========================
 
 class Form(StatesGroup):
@@ -392,11 +392,11 @@ def _cutoff_utc(days_ahead: int = SHOW_DAYS_AHEAD) -> datetime:
     cutoff_local = now_local + timedelta(days=days_ahead)
     return cutoff_local.astimezone(tz.UTC)
 
-# Кэш ближайших дат (увеличили TTL, чтобы меньше бить БД при навигации)
+# Кэш ближайших дат (TTL по умолчанию 60 c)
 _dates_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
-DATES_CACHE_TTL_SEC = int(os.getenv("DATES_CACHE_TTL_SEC", "60"))  # было 20 ⇒ 60
+DATES_CACHE_TTL_SEC = int(os.getenv("DATES_CACHE_TTL_SEC", "60"))
 
-# Кэш слотов по дате (уменьшает задержку при возврате/обновлении списка времени)
+# Кэш слотов по дате (TTL 30 c)
 _times_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 TIMES_CACHE_TTL_SEC = int(os.getenv("TIMES_CACHE_TTL_SEC", "30"))
 
@@ -442,10 +442,7 @@ def _times_cache_set(date_str: str, data: List[Dict[str, Any]]):
 # =========================
 
 async def fetch_available_dates_counts(session: AsyncSession) -> List[Dict[str, Any]]:
-    """
-    Берём слоты в ближайшие SHOW_DAYS_AHEAD (7) дней и группируем по локальной дате.
-    Результат кэшируется на DATES_CACHE_TTL_SEC.
-    """
+    """Берём слоты в ближайшие SHOW_DAYS_AHEAD дней и группируем по локальной дате."""
     cached = _dates_cache_get()
     if cached is not None:
         return cached
@@ -543,14 +540,18 @@ def build_times_kb(slots: List[Dict[str, Any]], date_str: str) -> Tuple[str, Inl
 
     rows, row = [], []
     for i, sl in enumerate(slots, start=1):
-        text_btn = human_dt(sl["start_utc"])  # формат в локальной TZ, читаемо и быстро
+        text_btn = human_dt(sl["start_utc"])  # локальный формат времени
         row.append(InlineKeyboardButton(text=text_btn, callback_data=f"slot:{sl['id']}"))
         if i % 2 == 0:
             rows.append(row); row = []
     if row:
         rows.append(row)
 
-    rows.append([InlineKeyboardButton(text="« К датам", callback_data="dates:0")])
+    rows.append([
+        InlineKeyboardButton(text="↻ Обновить", callback_data=f"refresh:{date_str}"),
+        InlineKeyboardButton(text="« К датам", callback_data="dates:0"),
+    ])
+
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     return ("Выберите время:", kb)
 
@@ -569,19 +570,6 @@ async def on_start(m: Message, state: FSMContext):
         await s.commit()
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Начать анкету", callback_data="form:start")]])
     await m.answer(WELCOME, reply_markup=kb)
-
-
-# === Анкета ===
-class Form(StatesGroup):
-    name = State()
-    tg_username = State()
-    phone = State()
-    ship_type = State()
-    position = State()
-    experience = State()
-    topic = State()
-    waiting_slot = State()
-    payment_method = State()
 
 
 @dp.callback_query(F.data == "form:start")
@@ -637,10 +625,8 @@ async def form_experience(m: Message, state: FSMContext):
 @dp.message(Form.topic)
 async def form_topic(m: Message, state: FSMContext):
     await state.update_data(topic=m.text.strip())
-    # Анкета собрана — открываем выбор дат
     await state.set_state(Form.waiting_slot)
 
-    # показываем даты
     async with Session() as s:
         all_days = await fetch_available_dates_counts(s)
     text, kb = build_dates_kb(all_days, page=0)
@@ -680,7 +666,6 @@ async def cb_book(cq: CallbackQuery, state: FSMContext):
     async with Session() as s:
         all_days = await fetch_available_dates_counts(s)
     text, kb = build_dates_kb(all_days, page=0)
-    # Быстрее обновляем тот же месседж, а не присылаем новый
     await cq.message.edit_text(text)
     await cq.message.edit_reply_markup(reply_markup=kb)
     await cq.answer()
@@ -708,10 +693,22 @@ async def cb_date_pick(cq: CallbackQuery, state: FSMContext):
     async with Session() as s:
         slots = await get_free_slots_for_local_date(s, date_str)
     text, kb = build_times_kb(slots, date_str)
-    # Обновляем тем же сообщением → меньше задержек
     await cq.message.edit_text(text)
     await cq.message.edit_reply_markup(reply_markup=kb)
     await cq.answer()
+
+
+@dp.callback_query(F.data.startswith("refresh:"))
+@_form_completed_guard
+async def cb_refresh_times(cq: CallbackQuery, state: FSMContext):
+    date_str = cq.data.split(":", 1)[1]
+    async with Session() as s:
+        _times_cache.pop(date_str, None)  # форс-обновление
+        slots = await get_free_slots_for_local_date(s, date_str)
+    text, kb = build_times_kb(slots, date_str)
+    await cq.message.edit_text(text)
+    await cq.message.edit_reply_markup(reply_markup=kb)
+    await cq.answer("Обновлено")
 
 
 @dp.callback_query(F.data.startswith("slot:"))
@@ -735,8 +732,15 @@ async def choose_slot(cq: CallbackQuery, state: FSMContext):
             slot_start_local=human_dt(start_utc),
             slot_end_local=human_dt(end_utc),
             slot_start_utc=start_utc,
-            slot_end_utc=end_utc
+            slot_end_utc=end_utc,
         )
+        # ——— Инвалидация кэша после бронирования ———
+        try:
+            _dates_cache.clear()
+            date_str = start_utc.astimezone(tz.gettz(TZ_NAME)).strftime("%Y-%m-%d")
+            _times_cache.pop(date_str, None)
+        except Exception:
+            pass
 
     await state.set_state(Form.payment_method)
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -753,7 +757,7 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
     pm = "Карта РФ" if cq.data.endswith("ru") else "Иностранная карта"
     data = await state.update_data(payment_method=pm)
 
-    # Calendar (sync API in thread)
+    # Calendar (sync API в отдельном потоке)
     gcal_event_id = ""
     try:
         start_utc = data.get("slot_start_utc")
@@ -798,7 +802,7 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
                 data.get("slot_start_local"),
                 data.get("slot_end_local"),
                 data.get("payment_method"),
-                gcal_event_id or ""
+                gcal_event_id or "",
             ])
     except Exception as e:
         print("WARN: Sheets append failed:", e)
@@ -876,7 +880,7 @@ async def testsheet(m: Message):
 
 
 # =========================
-# Webhook / Server
+# Webhook / Server (Railway)
 # =========================
 
 async def on_startup():
