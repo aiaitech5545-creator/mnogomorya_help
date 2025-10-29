@@ -33,7 +33,6 @@ from google.oauth2.service_account import Credentials as SheetsCreds
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials as CalCreds
 
-
 # =========================
 # ENV & BASIC DIAG
 # =========================
@@ -100,7 +99,6 @@ if not BOT_TOKEN or ":" not in BOT_TOKEN:
 if not DATABASE_URL_ENV:
     raise RuntimeError("DATABASE_URL отсутствует (подключи PostgreSQL на Railway).")
 
-
 # =========================
 # DB DEBUG / NORMALIZE
 # =========================
@@ -132,7 +130,6 @@ def debug_db_dns(url: str):
 DATABASE_URL = normalize_database_url(DATABASE_URL_ENV)
 debug_db_dns(DATABASE_URL)
 
-
 # =========================
 # Aiogram & DB engine/session
 # =========================
@@ -161,7 +158,6 @@ async def _db_self_test():
     except Exception as e:
         print("DB SELF-TEST: FAILED ->", repr(e))
         raise
-
 
 # =========================
 # DB schema init (ensure tables)
@@ -211,7 +207,6 @@ async def _db_init_schema():
         print("DB INIT: FAILED ->", repr(e))
         raise
 
-
 # =========================
 # AUTO-SLOTS (weekdays WORK_START_HOUR..WORK_END_HOUR local)
 # =========================
@@ -259,7 +254,6 @@ async def auto_slots_loop():
             print("AUTO-SLOTS loop warn:", e)
         await asyncio.sleep(6 * 3600)
 
-
 # =========================
 # UI texts
 # =========================
@@ -269,7 +263,6 @@ WELCOME = (
     f"💵 Стоимость консультации — ${PRICE_USD}.\n\n"
     "Сначала пройдём короткую анкету, затем выберем время 👇"
 )
-
 
 # =========================
 # Google Sheets (lazy init)
@@ -302,7 +295,6 @@ def get_sheet():
             ws.append_row(headers)
         _sheet = ws
     return _sheet
-
 
 # =========================
 # Google Calendar (lazy init)
@@ -337,7 +329,6 @@ def create_calendar_event_sync(start_utc, end_utc, summary, description):
         print("WARN: Calendar insert failed:", e)
         return ""
 
-
 # =========================
 # FSM (единое объявление)
 # =========================
@@ -351,7 +342,6 @@ class Form(StatesGroup):
     topic = State()
     waiting_slot = State()   # анкета собрана — ждём выбора слота
     payment_method = State()
-
 
 # =========================
 # Helpers: time windows & caching
@@ -403,7 +393,6 @@ def _times_cache_get(date_str: str) -> Optional[List[Dict[str, Any]]]:
 
 def _times_cache_set(date_str: str, data: List[Dict[str, Any]]):
     _times_cache[date_str] = (datetime.utcnow().timestamp(), data)
-
 
 # =========================
 # Fast queries
@@ -459,7 +448,6 @@ async def get_free_slots_for_local_date(session: AsyncSession, date_str: str) ->
     data = [dict(r) for r in rows]
     _times_cache_set(date_str, data)
     return data
-
 
 # =========================
 # UI builders (text + keyboards)
@@ -519,7 +507,6 @@ def build_times_kb(slots: List[Dict[str, Any]], date_str: str) -> Tuple[str, Inl
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     return ("Выберите время:", kb)
 
-
 # =========================
 # Handlers
 # =========================
@@ -534,13 +521,11 @@ async def on_start(m: Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Начать анкету", callback_data="form:start")]])
     await m.answer(WELCOME, reply_markup=kb)
 
-
 @dp.callback_query(F.data == "form:start")
 async def start_form(cq: CallbackQuery, state: FSMContext):
     await state.set_state(Form.name)
     await cq.message.answer("Как вас зовут? (только имя)")
     await cq.answer()
-
 
 @dp.message(Form.name)
 async def form_name(m: Message, state: FSMContext):
@@ -548,13 +533,11 @@ async def form_name(m: Message, state: FSMContext):
     await state.set_state(Form.tg_username)
     await m.answer("Ваш ник в Telegram (например, @username)?")
 
-
 @dp.message(Form.tg_username)
 async def form_tg(m: Message, state: FSMContext):
     await state.update_data(tg_username=m.text.strip())
     await state.set_state(Form.phone)
     await m.answer("Номер мобильного (необязательно). Если хотите пропустить — отправьте '-'")
-
 
 @dp.message(Form.phone)
 async def form_phone(m: Message, state: FSMContext):
@@ -563,13 +546,11 @@ async def form_phone(m: Message, state: FSMContext):
     await state.set_state(Form.ship_type)
     await m.answer("Тип судна, на котором вы работаете?")
 
-
 @dp.message(Form.ship_type)
 async def form_ship(m: Message, state: FSMContext):
     await state.update_data(ship_type=m.text.strip())
     await state.set_state(Form.position)
     await m.answer("Ваша должность?")
-
 
 @dp.message(Form.position)
 async def form_position(m: Message, state: FSMContext):
@@ -577,13 +558,11 @@ async def form_position(m: Message, state: FSMContext):
     await state.set_state(Form.experience)
     await m.answer("Опыт работы в должности (сколько лет/мес.)?")
 
-
 @dp.message(Form.experience)
 async def form_experience(m: Message, state: FSMContext):
     await state.update_data(experience=m.text.strip())
     await state.set_state(Form.topic)
     await m.answer("Что хотели бы обсудить на консультации?")
-
 
 @dp.message(Form.topic)
 async def form_topic(m: Message, state: FSMContext):
@@ -596,8 +575,7 @@ async def form_topic(m: Message, state: FSMContext):
     await m.answer("Спасибо! Теперь выберите удобную дату 👇")
     await m.answer(text, reply_markup=kb)
 
-
-# ===== Guard: не пускаем в бронирование, пока не собрана анкета (без проброса kwargs) =====
+# ===== Guard: не пускаем в бронирование, пока не собрана анкета =====
 def _form_completed_guard(func):
     @wraps(func)
     async def wrapper(event: Any, state: FSMContext, *args, **kwargs):
@@ -618,10 +596,9 @@ def _form_completed_guard(func):
                 except Exception:
                     pass
             return
-        # ключевой момент: НЕ передаём дальше *args/**kwargs → чтобы не прилетал 'bot=' и др.
+        # Важно: НЕ передаём дальше *args/**kwargs → чтобы не прилетал 'bot=' и др.
         return await func(event, state)
     return wrapper
-
 
 @dp.message(Command("book"))
 @_form_completed_guard
@@ -630,7 +607,6 @@ async def cmd_book(m: Message, state: FSMContext):
         all_days = await fetch_available_dates_counts(s)
     text, kb = build_dates_kb(all_days, page=0)
     await m.answer(text, reply_markup=kb)
-
 
 @dp.callback_query(F.data == "book")
 @_form_completed_guard
@@ -641,7 +617,6 @@ async def cb_book(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_text(text)
     await cq.message.edit_reply_markup(reply_markup=kb)
     await cq.answer()
-
 
 @dp.callback_query(F.data.startswith("dates:"))
 @_form_completed_guard
@@ -657,7 +632,6 @@ async def cb_dates_paged(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_reply_markup(reply_markup=kb)
     await cq.answer()
 
-
 @dp.callback_query(F.data.startswith("date:"))
 @_form_completed_guard
 async def cb_date_pick(cq: CallbackQuery, state: FSMContext):
@@ -668,7 +642,6 @@ async def cb_date_pick(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_text(text)
     await cq.message.edit_reply_markup(reply_markup=kb)
     await cq.answer()
-
 
 @dp.callback_query(F.data.startswith("refresh:"))
 @_form_completed_guard
@@ -682,7 +655,6 @@ async def cb_refresh_times(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_reply_markup(reply_markup=kb)
     await cq.answer("Обновлено")
 
-
 @dp.callback_query(F.data.startswith("slot:"))
 @_form_completed_guard
 async def choose_slot(cq: CallbackQuery, state: FSMContext):
@@ -690,7 +662,7 @@ async def choose_slot(cq: CallbackQuery, state: FSMContext):
     async with Session() as s:
         row = (await s.execute(text("SELECT start_utc, end_utc FROM slots WHERE id=:id"), {"id": slot_id})).first()
         upd = await s.execute(
-            text("UPDATE slots SET is_booked = true WHERE id=:id AND is_bookED=false RETURNING id".replace("bookED","booked")),
+            text("UPDATE slots SET is_booked = true WHERE id=:id AND is_booked=false RETURNING id"),
             {"id": slot_id}
         )
         if not upd.first():
@@ -722,7 +694,6 @@ async def choose_slot(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_text("Выберите способ оплаты (для учёта в заявке):")
     await cq.message.edit_reply_markup(reply_markup=kb)
     await cq.answer()
-
 
 @dp.callback_query(F.data.startswith("pay:"))
 async def payment_pick(cq: CallbackQuery, state: FSMContext):
@@ -778,7 +749,6 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_text("Спасибо! Заявка сохранена. Я свяжусь с вами для подтверждения. 🙌")
     await cq.message.edit_reply_markup(reply_markup=None)
     await cq.answer()
-
 
 # ---- Admin helpers
 @dp.message(Command("admin"))
@@ -836,7 +806,6 @@ async def testsheet(m: Message):
         await m.answer("✅ Тестовая строка записана в таблицу.")
     except Exception as e:
         await m.answer(f"⚠️ Ошибка Google Sheets: {e}")
-
 
 # =========================
 # Webhook / Server (Railway)
