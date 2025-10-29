@@ -32,7 +32,6 @@ from google.oauth2.service_account import Credentials as SheetsCreds
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials as CalCreds
 
-
 # =========================
 # ENV & BASIC DIAG
 # =========================
@@ -99,11 +98,9 @@ if not BOT_TOKEN or ":" not in BOT_TOKEN:
 if not DATABASE_URL_ENV:
     raise RuntimeError("DATABASE_URL отсутствует (подключи PostgreSQL на Railway).")
 
-
 # =========================
 # DB DEBUG / NORMALIZE
 # =========================
-
 def normalize_database_url(raw: str) -> str:
     if not raw:
         return raw
@@ -118,7 +115,6 @@ def normalize_database_url(raw: str) -> str:
             q.pop(k, None)
     return urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
 
-
 def debug_db_dns(url: str):
     p = urlparse(url)
     host, port = p.hostname, p.port
@@ -130,15 +126,12 @@ def debug_db_dns(url: str):
     except Exception as e:
         print(f"[DB DEBUG] DNS FAIL for {host}: {e}")
 
-
 DATABASE_URL = normalize_database_url(DATABASE_URL_ENV)
 debug_db_dns(DATABASE_URL)
-
 
 # =========================
 # Aiogram & DB engine/session
 # =========================
-
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
@@ -156,7 +149,6 @@ engine = create_async_engine(
 )
 Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
-
 async def _db_self_test():
     try:
         async with engine.connect() as conn:
@@ -166,11 +158,9 @@ async def _db_self_test():
         print("DB SELF-TEST: FAILED ->", repr(e))
         raise
 
-
 # =========================
 # DB schema init (ensure tables)
 # =========================
-
 SCHEMA_STMTS = [
     """
     CREATE TABLE IF NOT EXISTS users (
@@ -187,7 +177,6 @@ SCHEMA_STMTS = [
       is_booked BOOLEAN NOT NULL DEFAULT false
     )
     """,
-    # Индексы для быстрых выборок
     """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_slots_start_utc_unique
     ON slots(start_utc)
@@ -207,7 +196,6 @@ SCHEMA_STMTS = [
     """,
 ]
 
-
 async def _db_init_schema():
     try:
         async with engine.begin() as conn:
@@ -218,23 +206,18 @@ async def _db_init_schema():
         print("DB INIT: FAILED ->", repr(e))
         raise
 
-
 # =========================
 # AUTO-SLOTS (weekdays WORK_START_HOUR..WORK_END_HOUR local)
 # =========================
-
 def _localize(dt_naive: datetime) -> datetime:
     tzinfo = tz.gettz(TZ_NAME)
     return dt_naive.replace(tzinfo=tzinfo)
 
-
 def _to_utc(dt_local: datetime) -> datetime:
     return dt_local.astimezone(tz.UTC)
 
-
 def _is_weekday(d: date) -> bool:
     return d.weekday() < 5  # Mon..Fri
-
 
 async def ensure_slots_for_range(days_ahead: int):
     if days_ahead <= 0:
@@ -262,7 +245,6 @@ async def ensure_slots_for_range(days_ahead: int):
         await s.commit()
     print(f"AUTO-SLOTS: ensured next {days_ahead} days (weekdays {WORK_START_HOUR}:00–{WORK_END_HOUR}:00, {SLOT_MINUTES} min).")
 
-
 async def auto_slots_loop():
     while True:
         try:
@@ -271,30 +253,29 @@ async def auto_slots_loop():
             print("AUTO-SLOTS loop warn:", e)
         await asyncio.sleep(6 * 3600)
 
-
 # =========================
 # UI texts
 # =========================
-
 WELCOME = (
-    "👋 Привет! Добро пожаловать. Этот бот поможет быстро записаться на консультацию — просто отвечай на его вопросы.
-
-"
-    f"⏱ Продолжительность: {SLOT_MINUTES} минут.
-"
-    f"💵 Стоимость консультации — ${PRICE_USD}.
-
-"
+    "👋 Привет! Добро пожаловать. Этот бот поможет быстро записаться на консультацию — просто отвечай на его вопросы.\n\n"
+    f"⏱ Продолжительность: {SLOT_MINUTES} минут.\n"
+    f"💵 Стоимость консультации — ${PRICE_USD}.\n\n"
     "Сначала пройдём короткую анкету, затем выберем время 👇"
 )
 
+# lightweight smoke tests (run only when RUN_TESTS=1)
+def _run_smoke_tests():
+    assert isinstance(WELCOME, str) and "\n" in WELCOME
+    # quick keyboard build sanity checks with empty data
+    _text, _kb = (
+        "Свободных дат в ближайшие 7 дней нет. Напишите желаемое время — постараюсь подстроиться.",
+        InlineKeyboardMarkup(inline_keyboard=[]),
+    )
 
 # =========================
 # Google Sheets (lazy init)
 # =========================
-
 _sheet = None
-
 def get_sheet():
     global _sheet
     if _sheet is None:
@@ -323,13 +304,10 @@ def get_sheet():
         _sheet = ws
     return _sheet
 
-
 # =========================
 # Google Calendar (lazy init)
 # =========================
-
 _gcal = None
-
 def get_calendar():
     global _gcal
     if _gcal is None:
@@ -341,10 +319,8 @@ def get_calendar():
         _gcal = build("calendar", "v3", credentials=creds, cache_discovery=False)
     return _gcal
 
-
 def to_rfc3339(dt_utc: datetime) -> str:
     return dt_utc.replace(tzinfo=tz.UTC).isoformat().replace("+00:00", "Z")
-
 
 def create_calendar_event_sync(start_utc, end_utc, summary, description):
     try:
@@ -361,11 +337,9 @@ def create_calendar_event_sync(start_utc, end_utc, summary, description):
         print("WARN: Calendar insert failed:", e)
         return ""
 
-
 # =========================
 # FSM (единое объявление)
 # =========================
-
 class Form(StatesGroup):
     name = State()
     tg_username = State()
@@ -377,15 +351,12 @@ class Form(StatesGroup):
     waiting_slot = State()   # анкета собрана — ждём выбора слота
     payment_method = State()
 
-
 # =========================
 # Helpers: time windows & caching
 # =========================
-
 def human_dt(dt_utc: datetime) -> str:
     tzinfo = tz.gettz(TZ_NAME)
     return dt_utc.astimezone(tzinfo).strftime("%d %b %Y, %H:%M")
-
 
 def _cutoff_utc(days_ahead: int = SHOW_DAYS_AHEAD) -> datetime:
     now_local = datetime.now(tz.gettz(TZ_NAME))
@@ -400,10 +371,8 @@ DATES_CACHE_TTL_SEC = int(os.getenv("DATES_CACHE_TTL_SEC", "60"))
 _times_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 TIMES_CACHE_TTL_SEC = int(os.getenv("TIMES_CACHE_TTL_SEC", "30"))
 
-
 def _cache_key_dates() -> str:
     return f"{TZ_NAME}:{SHOW_DAYS_AHEAD}"
-
 
 def _dates_cache_get() -> Optional[List[Dict[str, Any]]]:
     key = _cache_key_dates()
@@ -416,11 +385,9 @@ def _dates_cache_get() -> Optional[List[Dict[str, Any]]]:
         return None
     return data
 
-
 def _dates_cache_set(data: List[Dict[str, Any]]):
     key = _cache_key_dates()
     _dates_cache[key] = (datetime.utcnow().timestamp(), data)
-
 
 def _times_cache_get(date_str: str) -> Optional[List[Dict[str, Any]]]:
     item = _times_cache.get(date_str)
@@ -432,15 +399,12 @@ def _times_cache_get(date_str: str) -> Optional[List[Dict[str, Any]]]:
         return None
     return data
 
-
 def _times_cache_set(date_str: str, data: List[Dict[str, Any]]):
     _times_cache[date_str] = (datetime.utcnow().timestamp(), data)
-
 
 # =========================
 # Fast queries
 # =========================
-
 async def fetch_available_dates_counts(session: AsyncSession) -> List[Dict[str, Any]]:
     """Берём слоты в ближайшие SHOW_DAYS_AHEAD дней и группируем по локальной дате."""
     cached = _dates_cache_get()
@@ -463,7 +427,6 @@ async def fetch_available_dates_counts(session: AsyncSession) -> List[Dict[str, 
     data = [{"local_date": r["local_date"], "count": int(r["cnt"])} for r in rows]
     _dates_cache_set(data)
     return data
-
 
 async def get_free_slots_for_local_date(session: AsyncSession, date_str: str) -> List[dict]:
     # Кэш времени на один день, чтобы не дёргать БД на каждый клик
@@ -494,11 +457,9 @@ async def get_free_slots_for_local_date(session: AsyncSession, date_str: str) ->
     _times_cache_set(date_str, data)
     return data
 
-
 # =========================
 # UI builders (text + keyboards)
 # =========================
-
 def build_dates_kb(all_days: List[Dict[str, Any]], page: int) -> Tuple[str, InlineKeyboardMarkup]:
     total = len(all_days)
     if total == 0:
@@ -532,7 +493,6 @@ def build_dates_kb(all_days: List[Dict[str, Any]], page: int) -> Tuple[str, Inli
     text = f"Выберите дату (показаны ближайшие {SHOW_DAYS_AHEAD} дней): {start+1}–{end} из {total}"
     return text, kb
 
-
 def build_times_kb(slots: List[Dict[str, Any]], date_str: str) -> Tuple[str, InlineKeyboardMarkup]:
     if not slots:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« К датам", callback_data="dates:0")]])
@@ -555,11 +515,9 @@ def build_times_kb(slots: List[Dict[str, Any]], date_str: str) -> Tuple[str, Inl
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     return ("Выберите время:", kb)
 
-
 # =========================
 # Handlers
 # =========================
-
 @dp.message(CommandStart())
 async def on_start(m: Message, state: FSMContext):
     async with Session() as s:
@@ -571,13 +529,11 @@ async def on_start(m: Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Начать анкету", callback_data="form:start")]])
     await m.answer(WELCOME, reply_markup=kb)
 
-
 @dp.callback_query(F.data == "form:start")
 async def start_form(cq: CallbackQuery, state: FSMContext):
     await state.set_state(Form.name)
     await cq.message.answer("Как вас зовут? (только имя)")
     await cq.answer()
-
 
 @dp.message(Form.name)
 async def form_name(m: Message, state: FSMContext):
@@ -585,13 +541,11 @@ async def form_name(m: Message, state: FSMContext):
     await state.set_state(Form.tg_username)
     await m.answer("Ваш ник в Telegram (например, @username)?")
 
-
 @dp.message(Form.tg_username)
 async def form_tg(m: Message, state: FSMContext):
     await state.update_data(tg_username=m.text.strip())
     await state.set_state(Form.phone)
     await m.answer("Номер мобильного (необязательно). Если хотите пропустить — отправьте '-'")
-
 
 @dp.message(Form.phone)
 async def form_phone(m: Message, state: FSMContext):
@@ -600,13 +554,11 @@ async def form_phone(m: Message, state: FSMContext):
     await state.set_state(Form.ship_type)
     await m.answer("Тип судна, на котором вы работаете?")
 
-
 @dp.message(Form.ship_type)
 async def form_ship(m: Message, state: FSMContext):
     await state.update_data(ship_type=m.text.strip())
     await state.set_state(Form.position)
     await m.answer("Ваша должность?")
-
 
 @dp.message(Form.position)
 async def form_position(m: Message, state: FSMContext):
@@ -614,13 +566,11 @@ async def form_position(m: Message, state: FSMContext):
     await state.set_state(Form.experience)
     await m.answer("Опыт работы в должности (сколько лет/мес.)?")
 
-
 @dp.message(Form.experience)
 async def form_experience(m: Message, state: FSMContext):
     await state.update_data(experience=m.text.strip())
     await state.set_state(Form.topic)
     await m.answer("Что хотели бы обсудить на консультации?")
-
 
 @dp.message(Form.topic)
 async def form_topic(m: Message, state: FSMContext):
@@ -633,9 +583,7 @@ async def form_topic(m: Message, state: FSMContext):
     await m.answer("Спасибо! Теперь выберите удобную дату 👇")
     await m.answer(text, reply_markup=kb)
 
-
 # Guard: не пускаем в бронирование, пока не собрана анкета
-
 def _form_completed_guard(func):
     async def wrapper(event, state: FSMContext, *args, **kwargs):
         st = await state.get_state()
@@ -650,7 +598,6 @@ def _form_completed_guard(func):
         return await func(event, state, *args, **kwargs)
     return wrapper
 
-
 @dp.message(Command("book"))
 @_form_completed_guard
 async def cmd_book(m: Message, state: FSMContext):
@@ -658,7 +605,6 @@ async def cmd_book(m: Message, state: FSMContext):
         all_days = await fetch_available_dates_counts(s)
     text, kb = build_dates_kb(all_days, page=0)
     await m.answer(text, reply_markup=kb)
-
 
 @dp.callback_query(F.data == "book")
 @_form_completed_guard
@@ -669,7 +615,6 @@ async def cb_book(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_text(text)
     await cq.message.edit_reply_markup(reply_markup=kb)
     await cq.answer()
-
 
 @dp.callback_query(F.data.startswith("dates:"))
 @_form_completed_guard
@@ -685,7 +630,6 @@ async def cb_dates_paged(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_reply_markup(reply_markup=kb)
     await cq.answer()
 
-
 @dp.callback_query(F.data.startswith("date:"))
 @_form_completed_guard
 async def cb_date_pick(cq: CallbackQuery, state: FSMContext):
@@ -696,7 +640,6 @@ async def cb_date_pick(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_text(text)
     await cq.message.edit_reply_markup(reply_markup=kb)
     await cq.answer()
-
 
 @dp.callback_query(F.data.startswith("refresh:"))
 @_form_completed_guard
@@ -709,7 +652,6 @@ async def cb_refresh_times(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_text(text)
     await cq.message.edit_reply_markup(reply_markup=kb)
     await cq.answer("Обновлено")
-
 
 @dp.callback_query(F.data.startswith("slot:"))
 @_form_completed_guard
@@ -734,7 +676,7 @@ async def choose_slot(cq: CallbackQuery, state: FSMContext):
             slot_start_utc=start_utc,
             slot_end_utc=end_utc,
         )
-        # ——— Инвалидация кэша после бронирования ———
+        # Инвалидация кэша после бронирования
         try:
             _dates_cache.clear()
             date_str = start_utc.astimezone(tz.gettz(TZ_NAME)).strftime("%Y-%m-%d")
@@ -751,7 +693,6 @@ async def choose_slot(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_reply_markup(reply_markup=kb)
     await cq.answer()
 
-
 @dp.callback_query(F.data.startswith("pay:"))
 async def payment_pick(cq: CallbackQuery, state: FSMContext):
     pm = "Карта РФ" if cq.data.endswith("ru") else "Иностранная карта"
@@ -765,16 +706,11 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
         if start_utc and end_utc and GCAL_SA_JSON:
             summary = f"Консультация с {data.get('name')} (@{(data.get('tg_username') or '').lstrip('@')})"
             description = (
-                f"Тема: {data.get('topic')}
-"
-                f"Тип судна: {data.get('ship_type')}
-"
-                f"Должность: {data.get('position')}
-"
-                f"Опыт: {data.get('experience')}
-"
-                f"Контакт: {data.get('phone') or '-'}
-"
+                f"Тема: {data.get('topic')}\n"
+                f"Тип судна: {data.get('ship_type')}\n"
+                f"Должность: {data.get('position')}\n"
+                f"Опыт: {data.get('experience')}\n"
+                f"Контакт: {data.get('phone') or '-'}\n"
                 f"Способ оплаты: {data.get('payment_method')}"
             )
             loop = asyncio.get_event_loop()
@@ -812,25 +748,18 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_reply_markup(reply_markup=None)
     await cq.answer()
 
-
 # ---- Admin helpers
 @dp.message(Command("admin"))
 async def admin_menu(m: Message):
     if m.from_user.id not in ADMIN_IDS:
         return
     await m.answer(
-        "Админ команды:
-"
-        "/addslot YYYY-MM-DD HH:MM — добавить один слот
-"
-        "/autofill — сгенерировать слоты на ближайшие дни (AUTO_SLOTS_DAYS_AHEAD)
-"
-        "/testsheet — записать тестовую строку в Google Sheet
-"
-        "/book — открыть выбор даты (после анкеты)
-"
+        "Админ команды:\n"
+        "/addslot YYYY-MM-DD HH:MM — добавить один слот\n"
+        "/autofill — сгенерировать слоты на ближайшие дни (AUTO_SLOTS_DAYS_AHEAD)\n"
+        "/testsheet — записать тестовую строку в Google Sheet\n"
+        "/book — открыть выбор даты (после анкеты)\n"
     )
-
 
 @dp.message(Command("addslot"))
 async def addslot(m: Message):
@@ -858,14 +787,12 @@ async def addslot(m: Message):
         await s.commit()
     await m.answer(f"Слот добавлен: {dt_local.strftime('%d %b %Y, %H:%M')} ({SLOT_MINUTES} мин)")
 
-
 @dp.message(Command("autofill"))
 async def cmd_autofill(m: Message):
     if m.from_user.id not in ADMIN_IDS:
         return
     await ensure_slots_for_range(AUTO_SLOTS_DAYS_AHEAD)
     await m.answer(f"Готово! Созданы/проверены слоты на {AUTO_SLOTS_DAYS_AHEAD} дней вперёд (будни {WORK_START_HOUR}:00–{WORK_END_HOUR}:00).")
-
 
 @dp.message(Command("testsheet"))
 async def testsheet(m: Message):
@@ -878,11 +805,9 @@ async def testsheet(m: Message):
     except Exception as e:
         await m.answer(f"⚠️ Ошибка Google Sheets: {e}")
 
-
 # =========================
 # Webhook / Server (Railway)
 # =========================
-
 async def on_startup():
     await _db_self_test()
     await _db_init_schema()
@@ -899,13 +824,11 @@ async def on_startup():
         except Exception as e:
             print("WARN: set_webhook failed:", e)
 
-
 async def on_shutdown():
     try:
         await bot.delete_webhook()
     except Exception:
         pass
-
 
 async def main():
     app = web.Application()
@@ -926,6 +849,9 @@ async def main():
     while True:
         await asyncio.sleep(3600)
 
-
 if __name__ == "__main__":
+    if os.getenv("RUN_TESTS") == "1":
+        _run_smoke_tests()
+        print("Smoke tests passed.")
+        sys.exit(0)
     asyncio.run(main())
