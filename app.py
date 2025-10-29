@@ -52,12 +52,12 @@ SLOT_MINUTES = int(os.getenv("SLOT_MINUTES", "60"))
 PRICE_USD = os.getenv("PRICE_USD", "75")
 SKIP_AUTO_WEBHOOK = os.getenv("SKIP_AUTO_WEBHOOK", "1") in ("1", "true", "True")
 
-# Слоты: создаём на 30 дней вперёд, показываем только 14
+# Генерируем слоты на 30 дней, показываем только 7
 AUTO_SLOTS_DAYS_AHEAD = int(os.getenv("AUTO_SLOTS_DAYS_AHEAD", "30"))
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "13"))
 WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "17"))  # последний стартовый час = WORK_END_HOUR-1
 
-SHOW_DAYS_AHEAD = int(os.getenv("SHOW_DAYS_AHEAD", "14"))
+SHOW_DAYS_AHEAD = int(os.getenv("SHOW_DAYS_AHEAD", "7"))
 SLOTS_DATE_PAGE_SIZE = int(os.getenv("SLOTS_DATE_PAGE_SIZE", "7"))
 
 # Google Sheets
@@ -361,12 +361,11 @@ def _cutoff_utc(days_ahead: int = SHOW_DAYS_AHEAD) -> datetime:
     cutoff_local = now_local + timedelta(days=days_ahead)
     return cutoff_local.astimezone(tz.UTC)
 
-# Простой кэш в памяти для списка доступных дат (30 секунд)
+# Простой кэш в памяти для списка доступных дат (20 секунд)
 _dates_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
-DATES_CACHE_TTL_SEC = 30
+DATES_CACHE_TTL_SEC = 20
 
 def _cache_key_dates() -> str:
-    # Можно добавить параметры в ключ, если будут разные фильтры
     return f"{TZ_NAME}:{SHOW_DAYS_AHEAD}"
 
 def _dates_cache_get() -> Optional[List[Dict[str, Any]]]:
@@ -390,8 +389,8 @@ def _dates_cache_set(data: List[Dict[str, Any]]):
 # =========================
 async def fetch_available_dates_counts(session: AsyncSession) -> List[Dict[str, Any]]:
     """
-    Быстрый запрос: берём слоты только в ближайшие 14 дней и группируем по локальной дате.
-    Кэшируем результат на 30 секунд.
+    Берём слоты в ближайшие SHOW_DAYS_AHEAD (7) дней и группируем по локальной дате.
+    Результат кэшируется на 20 секунд.
     """
     cached = _dates_cache_get()
     if cached is not None:
@@ -445,7 +444,7 @@ async def show_dates(target: Message, page: int = 0):
         all_days = await fetch_available_dates_counts(s)
 
     if not all_days:
-        await target.answer("Свободных дат в ближайшие 14 дней нет. Напишите желаемое время — постараюсь подстроиться.")
+        await target.answer("Свободных дат в ближайшие 7 дней нет. Напишите желаемое время — постараюсь подстроиться.")
         return
 
     # Пагинация в памяти
@@ -478,13 +477,13 @@ async def show_dates(target: Message, page: int = 0):
     await target.answer(f"Выберите дату (показаны ближайшие {SHOW_DAYS_AHEAD} дней): {start+1}–{end} из {total}", reply_markup=kb)
 
 async def show_times_for_date(target: Message, date_str: str):
-    # Дополнительно контролируем предел 14 дней
+    # Контроль предела 7 дней
     today_local = datetime.now(tz.gettz(TZ_NAME)).date()
     max_date = today_local + timedelta(days=SHOW_DAYS_AHEAD)
     picked = datetime.strptime(date_str, "%Y-%m-%d").date()
     if picked >= max_date:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« К датам", callback_data="dates:0")]])
-        await target.answer("Выбранная дата вне ближайших 14 дней. Пожалуйста, выберите другую.", reply_markup=kb)
+        await target.answer("Выбранная дата вне ближайших 7 дней. Пожалуйста, выберите другую.", reply_markup=kb)
         return
 
     async with Session() as s:
@@ -516,7 +515,6 @@ async def show_times_for_date(target: Message, date_str: str):
 @dp.message(CommandStart())
 async def on_start(m: Message, state: FSMContext):
     async with Session() as s:
-        # сохраняем пользователя (без блокировки)
         await s.execute(
             text("INSERT INTO users(tg_id, username) VALUES (:tg,:un) ON CONFLICT (tg_id) DO NOTHING"),
             {"tg": m.from_user.id, "un": m.from_user.username},
