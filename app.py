@@ -52,10 +52,14 @@ SLOT_MINUTES = int(os.getenv("SLOT_MINUTES", "60"))
 PRICE_USD = os.getenv("PRICE_USD", "75")
 SKIP_AUTO_WEBHOOK = os.getenv("SKIP_AUTO_WEBHOOK", "1") in ("1", "true", "True")
 
-# Автосоздание слотов
+# Автосоздание слотов (создаём на 30 дней вперёд, но показываем пользователю только 14 дней)
 AUTO_SLOTS_DAYS_AHEAD = int(os.getenv("AUTO_SLOTS_DAYS_AHEAD", "30"))
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "13"))
 WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "17"))  # последний стартовый час = WORK_END_HOUR-1
+
+# Ограничение отображения дат
+SHOW_DAYS_AHEAD = int(os.getenv("SHOW_DAYS_AHEAD", "14"))
+SLOTS_DATE_PAGE_SIZE = int(os.getenv("SLOTS_DATE_PAGE_SIZE", "7"))
 
 # Google Sheets
 GSPREAD_SA_JSON = os.getenv("GSPREAD_SERVICE_ACCOUNT_JSON", "")
@@ -96,10 +100,6 @@ if not DATABASE_URL_ENV:
 # DB DEBUG / NORMALIZE
 # =========================
 def normalize_database_url(raw: str) -> str:
-    """
-    Приводим URL к asyncpg и убираем ssl* параметры из query,
-    так как SSL задаём через connect_args с SSLContext.
-    """
     if not raw:
         return raw
     if raw.startswith("postgres://"):
@@ -177,7 +177,6 @@ SCHEMA_STMTS = [
       is_booked BOOLEAN NOT NULL DEFAULT false
     )
     """,
-    # уникальный индекс, чтобы не было дублей одного и того же времени старта
     """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_slots_start_utc_unique
     ON slots(start_utc)
@@ -215,11 +214,9 @@ def _to_utc(dt_local: datetime) -> datetime:
     return dt_local.astimezone(tz.UTC)
 
 def _is_weekday(d: date) -> bool:
-    # Monday=0 ... Sunday=6
-    return d.weekday() < 5
+    return d.weekday() < 5  # Mon..Fri
 
 async def ensure_slots_for_range(days_ahead: int):
-    """Создаёт слоты на каждый будний день на указанное число дней вперёд."""
     if days_ahead <= 0:
         return
     today_local = datetime.now(tz.gettz(TZ_NAME)).date()
@@ -234,7 +231,6 @@ async def ensure_slots_for_range(days_ahead: int):
                 end_local = start_local + timedelta(minutes=SLOT_MINUTES)
                 start_utc = _to_utc(start_local)
                 end_utc = _to_utc(end_local)
-                # ON CONFLICT DO NOTHING — благодаря уникальному индексу
                 await s.execute(
                     text("""
                         INSERT INTO slots(start_utc, end_utc, is_booked)
@@ -247,13 +243,12 @@ async def ensure_slots_for_range(days_ahead: int):
     print(f"AUTO-SLOTS: ensured next {days_ahead} days (weekdays {WORK_START_HOUR}:00–{WORK_END_HOUR}:00, {SLOT_MINUTES} min).")
 
 async def auto_slots_loop():
-    """Периодически поддерживаем наличие слотов на горизонте days_ahead."""
     while True:
         try:
             await ensure_slots_for_range(AUTO_SLOTS_DAYS_AHEAD)
         except Exception as e:
             print("AUTO-SLOTS loop warn:", e)
-        await asyncio.sleep(6 * 3600)  # каждые 6 часов
+        await asyncio.sleep(6 * 3600)
 
 
 # =========================
@@ -351,13 +346,19 @@ class Form(StatesGroup):
 
 
 # =========================
-# DB helpers
+# DB helpers + date/time windows
 # =========================
 def human_dt(dt_utc: datetime) -> str:
     tzinfo = tz.gettz(TZ_NAME)
     return dt_utc.astimezone(tzinfo).strftime("%d %b %Y, %H:%M")
 
+def _cutoff_utc(days_ahead: int = SHOW_DAYS_AHEAD) -> datetime:
+    now_local = datetime.now(tz.gettz(TZ_NAME))
+    cutoff_local = now_local + timedelta(days=days_ahead)
+    return cutoff_local.astimezone(tz.UTC)
+
 async def get_free_slots(session: AsyncSession) -> List[dict]:
+    # (оставлено для совместимости; но для дат используем ограничение 14 дней в других функциях)
     q = text("""
         SELECT id, start_utc, end_utc
         FROM slots
@@ -366,6 +367,63 @@ async def get_free_slots(session: AsyncSession) -> List[dict]:
         LIMIT 12
     """)
     rows = (await session.execute(q)).mappings().all()
+    return [dict(r) for r in rows]
+
+# === Список доступных дат и слоты в выбранный день (ограничены ближайшими 14 днями) ===
+async def count_available_dates(session: AsyncSession) -> int:
+    cutoff = _cutoff_utc()
+    q = text(f"""
+        SELECT COUNT(*) FROM (
+            SELECT (start_utc AT TIME ZONE '{TZ_NAME}')::date AS local_date
+            FROM slots
+            WHERE is_booked = false
+              AND start_utc > NOW()
+              AND start_utc < :cutoff
+            GROUP BY 1
+        ) t
+    """)
+    return (await session.execute(q, {"cutoff": cutoff})).scalar_one()
+
+async def get_available_dates_page(session: AsyncSession, limit: int, offset: int) -> List[dict]:
+    cutoff = _cutoff_utc()
+    q = text(f"""
+        SELECT
+            (start_utc AT TIME ZONE '{TZ_NAME}')::date AS local_date,
+            COUNT(*) AS cnt
+        FROM slots
+        WHERE is_booked = false
+          AND start_utc > NOW()
+          AND start_utc < :cutoff
+        GROUP BY 1
+        ORDER BY 1
+        LIMIT :limit OFFSET :offset
+    """)
+    rows = (await session.execute(q, {"cutoff": cutoff, "limit": limit, "offset": offset})).mappings().all()
+    return [{"local_date": r["local_date"], "count": r["cnt"]} for r in rows]
+
+def _local_midnight_bounds(date_str: str):
+    y, m, d = map(int, date_str.split("-"))
+    tzinfo = tz.gettz(TZ_NAME)
+    start_local = datetime(y, m, d, 0, 0, 0, tzinfo=tzinfo)
+    end_local = start_local + timedelta(days=1)
+    return start_local.astimezone(tz.UTC), end_local.astimezone(tz.UTC)
+
+async def get_free_slots_for_local_date(session: AsyncSession, date_str: str) -> List[dict]:
+    start_utc, end_utc = _local_midnight_bounds(date_str)
+    # Дополнительно ограничим верхнюю границу SHOW_DAYS_AHEAD на всякий случай
+    cutoff = _cutoff_utc()
+    if start_utc >= cutoff:
+        return []
+    q = text("""
+        SELECT id, start_utc, end_utc
+        FROM slots
+        WHERE is_booked = false
+          AND start_utc >= :s
+          AND start_utc <  :e
+          AND start_utc <  :cutoff
+        ORDER BY start_utc ASC
+    """)
+    rows = (await session.execute(q, {"s": start_utc, "e": end_utc, "cutoff": cutoff})).mappings().all()
     return [dict(r) for r in rows]
 
 async def ensure_user(session: AsyncSession, tg_id: int, username: Optional[str]) -> int:
@@ -377,6 +435,76 @@ async def ensure_user(session: AsyncSession, tg_id: int, username: Optional[str]
         {"tg": tg_id, "un": username}
     )).scalar_one()
     return uid
+
+
+# =========================
+# UI flows: выбор даты → выбор времени
+# =========================
+async def show_dates(target: Message, page: int = 0):
+    async with Session() as s:
+        total = await count_available_dates(s)
+        if total == 0:
+            await target.answer("Свободных дат в ближайшие 14 дней нет. Напишите желаемое время — постараюсь подстроиться.")
+            return
+        limit = SLOTS_DATE_PAGE_SIZE
+        offset = page * limit
+        days = await get_available_dates_page(s, limit=limit, offset=offset)
+
+    rows = []
+    row = []
+    for i, d in enumerate(days, start=1):
+        dt_txt = datetime.strptime(str(d["local_date"]), "%Y-%m-%d").strftime("%d %b, %a")
+        text_btn = f"📅 {dt_txt} ({d['count']})"
+        row.append(InlineKeyboardButton(text=text_btn, callback_data=f"date:{d['local_date']}"))
+        if i % 2 == 0:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="« Назад", callback_data=f"dates:{page-1}"))
+    if offset + limit < total:
+        nav.append(InlineKeyboardButton(text="Вперёд »", callback_data=f"dates:{page+1}"))
+    if nav:
+        rows.append(nav)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    cur_from = offset + 1
+    cur_to = min(offset + limit, total)
+    await target.answer(f"Выберите дату на ближайшие 14 дней ({cur_from}–{cur_to} из {total}):", reply_markup=kb)
+
+async def show_times_for_date(target: Message, date_str: str):
+    # Дополнительно проверим, что дата в пределах 14 дней
+    today_local = datetime.now(tz.gettz(TZ_NAME)).date()
+    max_date = today_local + timedelta(days=SHOW_DAYS_AHEAD)
+    picked = datetime.strptime(date_str, "%Y-%m-%d").date()
+    if picked >= max_date:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« К датам", callback_data="dates:0")]])
+        await target.answer("Выбранная дата вне ближайших 14 дней. Пожалуйста, выберите другую.", reply_markup=kb)
+        return
+
+    async with Session() as s:
+        slots = await get_free_slots_for_local_date(s, date_str)
+
+    if not slots:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« К датам", callback_data="dates:0")]])
+        await target.answer("На этот день слотов нет. Выберите другую дату.", reply_markup=kb)
+        return
+
+    rows, row = [], []
+    for i, sl in enumerate(slots, start=1):
+        text_btn = human_dt(sl["start_utc"])  # локальное время
+        row.append(InlineKeyboardButton(text=text_btn, callback_data=f"slot:{sl['id']}"))
+        if i % 2 == 0:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton(text="« К датам", callback_data="dates:0")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await target.answer("Выберите время:", reply_markup=kb)
 
 
 # =========================
@@ -440,33 +568,32 @@ async def form_experience(m: Message, state: FSMContext):
 async def form_topic(m: Message, state: FSMContext):
     await state.update_data(topic=m.text.strip())
     await state.set_state(Form.waiting_slot)
-    await m.answer("Спасибо! Теперь выберите удобное время: /book")
+    await m.answer("Спасибо! Теперь выберите удобную дату: /book")
 
+# --- бронирование: сначала даты, потом время
 @dp.message(Command("book"))
 async def cmd_book(m: Message, state: FSMContext):
-    await show_slots(m)
+    await show_dates(m, page=0)
 
 @dp.callback_query(F.data == "book")
 async def cb_book(cq: CallbackQuery, state: FSMContext):
-    await show_slots(cq.message)
+    await show_dates(cq.message, page=0)
     await cq.answer()
 
-async def show_slots(target: Message):
-    async with Session() as s:
-        slots = await get_free_slots(s)
-    if not slots:
-        await target.answer("Свободных слотов пока нет. Напишите желаемое время — постараюсь подстроиться.")
-        return
-    rows, row = [], []
-    for i, sl in enumerate(slots, start=1):
-        text_btn = human_dt(sl["start_utc"]) + f" ({SLOT_MINUTES} мин)"
-        row.append(InlineKeyboardButton(text=text_btn, callback_data=f"slot:{sl['id']}"))
-        if i % 2 == 0:
-            rows.append(row); row = []
-    if row:
-        rows.append(row)
-    kb = InlineKeyboardMarkup(inline_keyboard=rows)
-    await target.answer("Выберите удобное время:", reply_markup=kb)
+@dp.callback_query(F.data.startswith("dates:"))
+async def cb_dates_paged(cq: CallbackQuery, state: FSMContext):
+    try:
+        page = int(cq.data.split(":")[1])
+    except Exception:
+        page = 0
+    await show_dates(cq.message, page=page)
+    await cq.answer()
+
+@dp.callback_query(F.data.startswith("date:"))
+async def cb_date_pick(cq: CallbackQuery, state: FSMContext):
+    date_str = cq.data.split(":")[1]  # YYYY-MM-DD
+    await show_times_for_date(cq.message, date_str)
+    await cq.answer()
 
 @dp.callback_query(F.data.startswith("slot:"))
 async def choose_slot(cq: CallbackQuery, state: FSMContext):
@@ -611,9 +738,7 @@ async def testsheet(m: Message):
 async def on_startup():
     await _db_self_test()
     await _db_init_schema()
-    # Первичная генерация слотов
     await ensure_slots_for_range(AUTO_SLOTS_DAYS_AHEAD)
-    # Фоновая поддержка горизонта слотов
     asyncio.create_task(auto_slots_loop())
 
     if SKIP_AUTO_WEBHOOK:
