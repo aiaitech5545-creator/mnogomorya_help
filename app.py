@@ -259,7 +259,7 @@ WELCOME = (
     "⏱ Продолжительность: 45 минут.\n"
     "💡 Советую заранее продумать темы, которые хотел бы обсудить.\n"
     f"💵 Стоимость консультации — ${PRICE_USD}.\n\n"
-    "До скорой встречи!"
+    "Сначала пройдём короткую анкету, затем выберем время 👇"
 )
 
 
@@ -341,7 +341,7 @@ class Form(StatesGroup):
     position = State()
     experience = State()
     topic = State()
-    waiting_slot = State()
+    waiting_slot = State()   # анкета собрана — ждём выбора слота
     payment_method = State()
 
 
@@ -357,8 +357,8 @@ def _cutoff_utc(days_ahead: int = SHOW_DAYS_AHEAD) -> datetime:
     cutoff_local = now_local + timedelta(days=days_ahead)
     return cutoff_local.astimezone(tz.UTC)
 
+# (оставлено как вспомогательное; основной флоу — по датам)
 async def get_free_slots(session: AsyncSession) -> List[dict]:
-    # (оставлено для совместимости; но для дат используем ограничение 14 дней в других функциях)
     q = text("""
         SELECT id, start_utc, end_utc
         FROM slots
@@ -410,7 +410,6 @@ def _local_midnight_bounds(date_str: str):
 
 async def get_free_slots_for_local_date(session: AsyncSession, date_str: str) -> List[dict]:
     start_utc, end_utc = _local_midnight_bounds(date_str)
-    # Дополнительно ограничим верхнюю границу SHOW_DAYS_AHEAD на всякий случай
     cutoff = _cutoff_utc()
     if start_utc >= cutoff:
         return []
@@ -475,7 +474,6 @@ async def show_dates(target: Message, page: int = 0):
     await target.answer(f"Выберите дату на ближайшие 14 дней ({cur_from}–{cur_to} из {total}):", reply_markup=kb)
 
 async def show_times_for_date(target: Message, date_str: str):
-    # Дополнительно проверим, что дата в пределах 14 дней
     today_local = datetime.now(tz.gettz(TZ_NAME)).date()
     max_date = today_local + timedelta(days=SHOW_DAYS_AHEAD)
     picked = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -494,7 +492,7 @@ async def show_times_for_date(target: Message, date_str: str):
 
     rows, row = [], []
     for i, sl in enumerate(slots, start=1):
-        text_btn = human_dt(sl["start_utc"])  # локальное время
+        text_btn = human_dt(sl["start_utc"])
         row.append(InlineKeyboardButton(text=text_btn, callback_data=f"slot:{sl['id']}"))
         if i % 2 == 0:
             rows.append(row); row = []
@@ -517,7 +515,6 @@ async def on_start(m: Message, state: FSMContext):
         await s.commit()
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Начать анкету", callback_data="form:start")],
-        [InlineKeyboardButton(text="🗓 Выбрать слот", callback_data="book")],
     ])
     await m.answer(WELCOME, reply_markup=kb)
 
@@ -567,20 +564,41 @@ async def form_experience(m: Message, state: FSMContext):
 @dp.message(Form.topic)
 async def form_topic(m: Message, state: FSMContext):
     await state.update_data(topic=m.text.strip())
+    # Анкета собрана — сразу открываем выбор дат и блокируем доступ к /book, пока не дойдём до выбора времени
     await state.set_state(Form.waiting_slot)
-    await m.answer("Спасибо! Теперь выберите удобную дату: /book")
+    await m.answer("Спасибо! Теперь выберите удобную дату 👇")
+    await show_dates(m, page=0)
 
-# --- бронирование: сначала даты, потом время
+# Старт выбора дат/времени допускаем только если анкета собрана (Form.waiting_slot)
+def _form_completed_guard(func):
+    async def wrapper(event, state: FSMContext, *args, **kwargs):
+        st = await state.get_state()
+        if st != Form.waiting_slot:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📝 Начать анкету", callback_data="form:start")],
+            ])
+            if isinstance(event, Message):
+                await event.answer("Сначала, пожалуйста, пройдите короткую анкету.", reply_markup=kb)
+            else:
+                await event.message.answer("Сначала, пожалуйста, пройдите короткую анкету.", reply_markup=kb)
+                await event.answer()
+            return
+        return await func(event, state, *args, **kwargs)
+    return wrapper
+
 @dp.message(Command("book"))
+@_form_completed_guard
 async def cmd_book(m: Message, state: FSMContext):
     await show_dates(m, page=0)
 
 @dp.callback_query(F.data == "book")
+@_form_completed_guard
 async def cb_book(cq: CallbackQuery, state: FSMContext):
     await show_dates(cq.message, page=0)
     await cq.answer()
 
 @dp.callback_query(F.data.startswith("dates:"))
+@_form_completed_guard
 async def cb_dates_paged(cq: CallbackQuery, state: FSMContext):
     try:
         page = int(cq.data.split(":")[1])
@@ -590,12 +608,14 @@ async def cb_dates_paged(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 @dp.callback_query(F.data.startswith("date:"))
+@_form_completed_guard
 async def cb_date_pick(cq: CallbackQuery, state: FSMContext):
     date_str = cq.data.split(":")[1]  # YYYY-MM-DD
     await show_times_for_date(cq.message, date_str)
     await cq.answer()
 
 @dp.callback_query(F.data.startswith("slot:"))
+@_form_completed_guard
 async def choose_slot(cq: CallbackQuery, state: FSMContext):
     slot_id = int(cq.data.split(":")[1])
     async with Session() as s:
@@ -685,6 +705,7 @@ async def admin_menu(m: Message):
         "/addslot YYYY-MM-DD HH:MM — добавить один слот\n"
         "/autofill — сгенерировать слоты на ближайшие дни (AUTO_SLOTS_DAYS_AHEAD)\n"
         "/testsheet — записать тестовую строку в Google Sheet\n"
+        "/book — (после анкеты) открыть выбор даты\n"
     )
 
 @dp.message(Command("addslot"))
