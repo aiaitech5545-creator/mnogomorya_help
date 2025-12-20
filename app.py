@@ -58,7 +58,7 @@ SLOTS_DATE_PAGE_SIZE = int(os.getenv("SLOTS_DATE_PAGE_SIZE", "7"))
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "13"))
 WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "17"))
 
-# For Railway webhook mode, default should be 0 (False)
+# For Railway webhook mode: default 0 (False) so webhook is set automatically
 SKIP_AUTO_WEBHOOK = os.getenv("SKIP_AUTO_WEBHOOK", "0") in ("1", "true", "True")
 
 # Google Sheets
@@ -67,7 +67,7 @@ GSPREAD_SHEET_ID = os.getenv("GSPREAD_SHEET_ID", "")
 
 # Google Calendar (optional)
 GCAL_SA_JSON = os.getenv("GCAL_SERVICE_ACCOUNT_JSON", "")
-GCAL_CALENDAR_ID = os.getenv("GCAL_CALENDAR_ID", "")  # лучше задавать конкретный ID календаря, не "primary"
+GCAL_CALENDAR_ID = os.getenv("GCAL_CALENDAR_ID", "")  # лучше задавать конкретный ID календаря
 
 # Cache TTL
 DATES_CACHE_TTL_SEC = int(os.getenv("DATES_CACHE_TTL_SEC", "60"))
@@ -84,7 +84,6 @@ print("==== DIAG: startup ====")
 print("Python:", sys.version)
 try:
     import aiogram  # noqa
-
     print("Aiogram:", aiogram.__version__)
 except Exception:
     print("Aiogram: unknown")
@@ -118,13 +117,12 @@ def normalize_database_url(raw: str) -> str:
     if not raw:
         return raw
     if raw.startswith("postgres://"):
-        raw = "postgresql+asyncpg://" + raw[len("postgres://") :]
+        raw = "postgresql+asyncpg://" + raw[len("postgres://"):]
     if raw.startswith("postgresql://") and "+asyncpg" not in raw:
         raw = raw.replace("postgresql://", "postgresql+asyncpg://", 1)
 
     u = urlparse(raw)
     q = dict(parse_qsl(u.query or "", keep_blank_values=True))
-    # remove ssl query params; we set ssl via connect_args
     for k in list(q.keys()):
         if k.lower().startswith("ssl"):
             q.pop(k, None)
@@ -153,7 +151,6 @@ debug_db_dns(DATABASE_URL)
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# Railway PG proxy often needs TLS and may be self-signed
 SSL_CTX = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
@@ -209,7 +206,7 @@ async def _db_init_schema():
 
 
 # ============================================================
-# Time utils
+# Helpers
 # ============================================================
 WELCOME = (
     "👋 Привет! Добро пожаловать. Этот бот поможет быстро записаться на консультацию — просто отвечай на его вопросы.\n\n"
@@ -233,16 +230,18 @@ def _cutoff_utc(days_ahead: int = SHOW_DAYS_AHEAD) -> datetime:
 
 
 async def notify_admins(text_msg: str):
+    """Best-effort notify admins in Telegram."""
     if not ADMIN_IDS:
         return
     for aid in ADMIN_IDS:
         try:
-            await bot.send_message(aid, f"⚠️ {text_msg}")
+            await bot.send_message(aid, text_msg)
         except Exception:
             pass
 
 
 async def safe_edit(msg: Message, text_msg: str, kb: Optional[InlineKeyboardMarkup]):
+    """Avoid crashing on Telegram 'message is not modified'."""
     try:
         await msg.edit_text(text_msg)
         await msg.edit_reply_markup(reply_markup=kb)
@@ -250,6 +249,35 @@ async def safe_edit(msg: Message, text_msg: str, kb: Optional[InlineKeyboardMark
         if "message is not modified" in str(e).lower():
             return
         raise
+
+
+def format_new_booking_admin_message(data: dict, tg_user_id: int, tg_username_fallback: str, gcal_event_id: str) -> str:
+    name = data.get("name") or "-"
+    tg_username = data.get("tg_username") or tg_username_fallback or "-"
+    phone = data.get("phone") or "-"
+    ship_type = data.get("ship_type") or "-"
+    position = data.get("position") or "-"
+    exp = data.get("experience") or "-"
+    topic = data.get("topic") or "-"
+    slot_start = data.get("slot_start_local") or "-"
+    slot_end = data.get("slot_end_local") or "-"
+    pm = data.get("payment_method") or "-"
+    gcal = gcal_event_id or "-"
+
+    return (
+        "✅ <b>Новая запись на консультацию</b>\n\n"
+        f"👤 <b>Имя:</b> {name}\n"
+        f"🆔 <b>TG ID:</b> <code>{tg_user_id}</code>\n"
+        f"🔗 <b>Ник:</b> {tg_username}\n"
+        f"📞 <b>Телефон:</b> {phone}\n\n"
+        f"🚢 <b>Судно:</b> {ship_type}\n"
+        f"🎖 <b>Должность:</b> {position}\n"
+        f"⏳ <b>Опыт:</b> {exp}\n\n"
+        f"📝 <b>Тема:</b> {topic}\n\n"
+        f"🗓 <b>Слот:</b> {slot_start} — {slot_end}\n"
+        f"💳 <b>Оплата:</b> {pm}\n"
+        f"📅 <b>GCAL:</b> {gcal}\n"
+    )
 
 
 # ============================================================
@@ -293,7 +321,9 @@ async def ensure_slots_for_range(days_ahead: int):
                     {"s": start_utc, "e": end_utc},
                 )
         await s.commit()
-    print(f"AUTO-SLOTS: ensured next {days_ahead} days (weekdays {WORK_START_HOUR}:00–{WORK_END_HOUR}:00, {SLOT_MINUTES} min).")
+    print(
+        f"AUTO-SLOTS: ensured next {days_ahead} days (weekdays {WORK_START_HOUR}:00–{WORK_END_HOUR}:00, {SLOT_MINUTES} min)."
+    )
 
 
 async def auto_slots_loop():
@@ -351,8 +381,8 @@ def get_sheet():
 
 def append_row_sync(row: list):
     """
-    ВАЖНО: append_rows + INSERT_ROWS гарантирует добавление новой строки
-    и убирает проблему 'перезаписываются друг друга'.
+    append_rows + INSERT_ROWS гарантирует добавление новой строки
+    и убирает проблему перезаписи заявок.
     """
     ws = get_sheet()
     try:
@@ -364,7 +394,7 @@ def append_row_sync(row: list):
 
 
 # ============================================================
-# Google Calendar (optional, SYNC only)
+# Google Calendar (optional)
 # ============================================================
 _gcal = None
 
@@ -424,13 +454,12 @@ def _cache_key_dates() -> str:
 
 
 def _dates_cache_get() -> Optional[List[Dict[str, Any]]]:
-    key = _cache_key_dates()
-    item = _dates_cache.get(key)
+    item = _dates_cache.get(_cache_key_dates())
     if not item:
         return None
     ts, data = item
     if (datetime.utcnow().timestamp() - ts) > DATES_CACHE_TTL_SEC:
-        _dates_cache.pop(key, None)
+        _dates_cache.pop(_cache_key_dates(), None)
         return None
     return data
 
@@ -531,7 +560,9 @@ def build_dates_kb(all_days: List[Dict[str, Any]], page: int) -> Tuple[str, Inli
     row: List[InlineKeyboardButton] = []
     for i, dct in enumerate(days, start=1):
         dt_txt = datetime.strptime(str(dct["local_date"]), "%Y-%m-%d").strftime("%d %b, %a")
-        row.append(InlineKeyboardButton(text=f"📅 {dt_txt} ({dct['count']})", callback_data=f"date:{dct['local_date']}"))
+        row.append(
+            InlineKeyboardButton(text=f"📅 {dt_txt} ({dct['count']})", callback_data=f"date:{dct['local_date']}")
+        )
         if i % 2 == 0:
             rows.append(row)
             row = []
@@ -584,7 +615,9 @@ def _form_completed_guard(func):
     async def wrapper(event: Any, state: FSMContext, *args, **kwargs):
         st = await state.get_state()
         if st not in (Form.waiting_slot, Form.payment_method):
-            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Начать анкету", callback_data="form:start")]])
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="📝 Начать анкету", callback_data="form:start")]]
+            )
             if isinstance(event, Message):
                 await event.answer("Сначала, пожалуйста, пройдите короткую анкету.", reply_markup=kb)
             else:
@@ -801,9 +834,10 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
             )
         except Exception as e:
             print("WARN: Calendar insert failed:", repr(e))
-            await notify_admins(f"Calendar insert failed: {repr(e)}")
+            await notify_admins(f"⚠️ Calendar insert failed: <code>{repr(e)}</code>")
 
-    # Sheets in executor ✅ with INSERT_ROWS to avoid overwrites
+    # Sheets in executor ✅ + INSERT_ROWS to avoid overwrites
+    sheets_ok = False
     try:
         if not (GSPREAD_SA_JSON and GSPREAD_SHEET_ID):
             print("INFO: Sheets not configured; skipping append.")
@@ -826,10 +860,25 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
             ]
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda: append_row_sync(row))
+            sheets_ok = True
             print("SHEETS: append OK")
     except Exception as e:
         print("WARN: Sheets append failed:", repr(e))
-        await notify_admins(f"Sheets append failed: {repr(e)}")
+        await notify_admins(f"⚠️ Sheets append failed: <code>{repr(e)}</code>")
+
+    # ✅ Notify admins about new booking (only if sheets OK; можно убрать условие)
+    try:
+        if sheets_ok:
+            tg_username_fallback = "@" + (cq.from_user.username or "") if cq.from_user.username else "-"
+            msg = format_new_booking_admin_message(
+                data=data,
+                tg_user_id=cq.from_user.id,
+                tg_username_fallback=tg_username_fallback,
+                gcal_event_id=gcal_event_id,
+            )
+            await notify_admins(msg)
+    except Exception as e:
+        print("WARN: notify_admins failed:", repr(e))
 
     await state.clear()
     await safe_edit(cq.message, "Спасибо! Заявка сохранена. Я свяжусь с вами для подтверждения. 🙌", None)
@@ -847,7 +896,13 @@ async def admin_menu(m: Message):
         "Админ команды:\n"
         "/autofill — сгенерировать слоты на ближайшие дни (AUTO_SLOTS_DAYS_AHEAD)\n"
         "/testsheet — записать тестовую строку в Google Sheet\n"
+        "/myid — покажет твой Telegram ID\n"
     )
+
+
+@dp.message(Command("myid"))
+async def myid(m: Message):
+    await m.answer(f"Ваш Telegram ID: <code>{m.from_user.id}</code>")
 
 
 @dp.message(Command("autofill"))
@@ -870,7 +925,7 @@ async def testsheet(m: Message):
         await loop.run_in_executor(None, lambda: append_row_sync(["test", datetime.utcnow().isoformat()]))
         await m.answer("✅ Тестовая строка записана в таблицу.")
     except Exception as e:
-        await m.answer(f"⚠️ Ошибка Google Sheets: {repr(e)}")
+        await m.answer(f"⚠️ Ошибка Google Sheets: <code>{repr(e)}</code>")
 
 
 # ============================================================
@@ -888,7 +943,7 @@ async def on_startup():
 
     if not BASE_URL:
         print("WARN: BASE_URL пустой — не могу поставить webhook.")
-        await notify_admins("BASE_URL пустой — бот не сможет поставить webhook автоматически.")
+        await notify_admins("⚠️ BASE_URL пустой — бот не сможет поставить webhook автоматически.")
         return
 
     try:
@@ -896,7 +951,7 @@ async def on_startup():
         print("Webhook set to", f"{BASE_URL}/webhook")
     except Exception as e:
         print("WARN: set_webhook failed:", repr(e))
-        await notify_admins(f"set_webhook failed: {repr(e)}")
+        await notify_admins(f"⚠️ set_webhook failed: <code>{repr(e)}</code>")
 
 
 async def on_shutdown():
