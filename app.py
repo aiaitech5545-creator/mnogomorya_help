@@ -36,6 +36,7 @@ from google.oauth2.service_account import Credentials as SheetsCreds
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials as CalCreds
 
+
 # ============================================================
 # ENV
 # ============================================================
@@ -43,7 +44,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATABASE_URL_ENV = os.getenv("DATABASE_URL", "")
-BASE_URL = os.getenv("BASE_URL", "")  # e.g. https://xxxx.up.railway.app
+BASE_URL = os.getenv("BASE_URL", "")  # https://xxxx.up.railway.app
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
 TZ_NAME = os.getenv("TZ", "Europe/Stockholm")
@@ -57,7 +58,7 @@ SLOTS_DATE_PAGE_SIZE = int(os.getenv("SLOTS_DATE_PAGE_SIZE", "7"))
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "13"))
 WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "17"))
 
-# IMPORTANT: for Railway webhook mode, default should be 0 (False)
+# For Railway webhook mode, default should be 0 (False)
 SKIP_AUTO_WEBHOOK = os.getenv("SKIP_AUTO_WEBHOOK", "0") in ("1", "true", "True")
 
 # Google Sheets
@@ -66,7 +67,7 @@ GSPREAD_SHEET_ID = os.getenv("GSPREAD_SHEET_ID", "")
 
 # Google Calendar (optional)
 GCAL_SA_JSON = os.getenv("GCAL_SERVICE_ACCOUNT_JSON", "")
-GCAL_CALENDAR_ID = os.getenv("GCAL_CALENDAR_ID", "")  # recommend: set explicit calendar id, not "primary"
+GCAL_CALENDAR_ID = os.getenv("GCAL_CALENDAR_ID", "")  # лучше задавать конкретный ID календаря, не "primary"
 
 # Cache TTL
 DATES_CACHE_TTL_SEC = int(os.getenv("DATES_CACHE_TTL_SEC", "60"))
@@ -90,6 +91,12 @@ except Exception:
 print("BOT_TOKEN:", mask_token(BOT_TOKEN))
 print("BASE_URL:", BASE_URL or "EMPTY")
 print("DATABASE_URL set:", bool(DATABASE_URL_ENV))
+try:
+    u0 = urlparse(DATABASE_URL_ENV or "")
+    print("DB scheme(raw):", u0.scheme or "EMPTY")
+    print("DB host(raw):", u0.hostname or "EMPTY")
+except Exception as e:
+    print("DIAG urlparse failed:", repr(e))
 print("GSPREAD_SHEET_ID set:", bool(GSPREAD_SHEET_ID))
 print("GCAL enabled:", bool(GCAL_SA_JSON))
 print("GCAL_CALENDAR_ID:", GCAL_CALENDAR_ID or "EMPTY")
@@ -133,7 +140,7 @@ def debug_db_dns(url: str):
         ip = socket.gethostbyname(host)
         print(f"[DB DEBUG] DNS OK -> {host} -> {ip}")
     except Exception as e:
-        print(f"[DB DEBUG] DNS FAIL for {host}: {e}")
+        print(f"[DB DEBUG] DNS FAIL for {host}: {repr(e)}")
 
 
 DATABASE_URL = normalize_database_url(DATABASE_URL_ENV)
@@ -334,22 +341,26 @@ def get_sheet():
         try:
             first = ws.row_values(1)
             if not first:
-                ws.append_row(headers)
+                ws.append_rows([headers], value_input_option="RAW", insert_data_option="INSERT_ROWS")
         except Exception:
-            ws.append_row(headers)
+            ws.append_rows([headers], value_input_option="RAW", insert_data_option="INSERT_ROWS")
 
         _sheet = ws
     return _sheet
 
 
 def append_row_sync(row: list):
+    """
+    ВАЖНО: append_rows + INSERT_ROWS гарантирует добавление новой строки
+    и убирает проблему 'перезаписываются друг друга'.
+    """
     ws = get_sheet()
     try:
-        ws.append_row(row)
+        ws.append_rows([row], value_input_option="RAW", insert_data_option="INSERT_ROWS")
         return
     except Exception:
         time.sleep(2)
-        ws.append_row(row)
+        ws.append_rows([row], value_input_option="RAW", insert_data_option="INSERT_ROWS")
 
 
 # ============================================================
@@ -506,7 +517,10 @@ async def get_free_slots_for_local_date(session: AsyncSession, date_str: str) ->
 def build_dates_kb(all_days: List[Dict[str, Any]], page: int) -> Tuple[str, InlineKeyboardMarkup]:
     total = len(all_days)
     if total == 0:
-        return ("Свободных дат в ближайшие дни нет. Напишите желаемое время — постараюсь подстроиться.", InlineKeyboardMarkup(inline_keyboard=[]))
+        return (
+            "Свободных дат в ближайшие дни нет. Напишите желаемое время — постараюсь подстроиться.",
+            InlineKeyboardMarkup(inline_keyboard=[]),
+        )
 
     limit = SLOTS_DATE_PAGE_SIZE
     start = page * limit
@@ -532,7 +546,10 @@ def build_dates_kb(all_days: List[Dict[str, Any]], page: int) -> Tuple[str, Inli
     if nav:
         rows.append(nav)
 
-    return (f"Выберите дату (показаны ближайшие {SHOW_DAYS_AHEAD} дней): {start+1}–{end} из {total}", InlineKeyboardMarkup(inline_keyboard=rows))
+    return (
+        f"Выберите дату (показаны ближайшие {SHOW_DAYS_AHEAD} дней): {start+1}–{end} из {total}",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
 
 
 def build_times_kb(slots: List[Dict[str, Any]], date_str: str) -> Tuple[str, InlineKeyboardMarkup]:
@@ -550,7 +567,12 @@ def build_times_kb(slots: List[Dict[str, Any]], date_str: str) -> Tuple[str, Inl
     if row:
         rows.append(row)
 
-    rows.append([InlineKeyboardButton(text="↻ Обновить", callback_data=f"refresh:{date_str}"), InlineKeyboardButton(text="« К датам", callback_data="dates:0")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="↻ Обновить", callback_data=f"refresh:{date_str}"),
+            InlineKeyboardButton(text="« К датам", callback_data="dates:0"),
+        ]
+    )
     return ("Выберите время:", InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -591,6 +613,7 @@ async def on_start(m: Message, state: FSMContext):
             {"tg": m.from_user.id, "un": m.from_user.username},
         )
         await s.commit()
+
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Начать анкету", callback_data="form:start")]])
     await m.answer(WELCOME, reply_markup=kb)
 
@@ -664,15 +687,6 @@ async def form_topic(m: Message, state: FSMContext):
     await m.answer(text_msg, reply_markup=kb)
 
 
-@dp.message(Command("book"))
-@_form_completed_guard
-async def cmd_book(m: Message, state: FSMContext):
-    async with Session() as s:
-        all_days = await fetch_available_dates_counts(s)
-    text_msg, kb = build_dates_kb(all_days, page=0)
-    await m.answer(text_msg, reply_markup=kb)
-
-
 @dp.callback_query(F.data.startswith("dates:"))
 @_form_completed_guard
 async def cb_dates_paged(cq: CallbackQuery, state: FSMContext):
@@ -741,7 +755,6 @@ async def choose_slot(cq: CallbackQuery, state: FSMContext):
         slot_end_utc=end_utc,
     )
 
-    # invalidate caches
     _dates_cache.clear()
     try:
         day_key = start_utc.astimezone(_tzinfo()).strftime("%Y-%m-%d")
@@ -790,7 +803,7 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
             print("WARN: Calendar insert failed:", repr(e))
             await notify_admins(f"Calendar insert failed: {repr(e)}")
 
-    # Sheets in executor ✅ MAIN FIX
+    # Sheets in executor ✅ with INSERT_ROWS to avoid overwrites
     try:
         if not (GSPREAD_SA_JSON and GSPREAD_SHEET_ID):
             print("INFO: Sheets not configured; skipping append.")
@@ -832,7 +845,6 @@ async def admin_menu(m: Message):
         return
     await m.answer(
         "Админ команды:\n"
-        "/addslot YYYY-MM-DD HH:MM — добавить один слот\n"
         "/autofill — сгенерировать слоты на ближайшие дни (AUTO_SLOTS_DAYS_AHEAD)\n"
         "/testsheet — записать тестовую строку в Google Sheet\n"
     )
