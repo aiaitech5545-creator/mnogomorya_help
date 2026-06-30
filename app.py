@@ -49,7 +49,7 @@ ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 
 TZ_NAME = os.getenv("TZ", "Europe/Stockholm")
 SLOT_MINUTES = int(os.getenv("SLOT_MINUTES", "60"))
-PRICE_USD = os.getenv("PRICE_USD", "75")
+PRICE_USD = os.getenv("PRICE_USD", "99")
 
 AUTO_SLOTS_DAYS_AHEAD = int(os.getenv("AUTO_SLOTS_DAYS_AHEAD", "30"))
 SHOW_DAYS_AHEAD = int(os.getenv("SHOW_DAYS_AHEAD", "7"))
@@ -67,7 +67,7 @@ GSPREAD_SHEET_ID = os.getenv("GSPREAD_SHEET_ID", "")
 
 # Google Calendar (optional)
 GCAL_SA_JSON = os.getenv("GCAL_SERVICE_ACCOUNT_JSON", "")
-GCAL_CALENDAR_ID = os.getenv("GCAL_CALENDAR_ID", "")  # лучше задавать конкретный ID календаря
+GCAL_CALENDAR_ID = os.getenv("GCAL_CALENDAR_ID", "")
 
 # Cache TTL
 DATES_CACHE_TTL_SEC = int(os.getenv("DATES_CACHE_TTL_SEC", "60"))
@@ -211,7 +211,8 @@ async def _db_init_schema():
 WELCOME = (
     "👋 Привет! Добро пожаловать. Этот бот поможет быстро записаться на консультацию — просто отвечай на его вопросы.\n\n"
     f"⏱ Продолжительность: {SLOT_MINUTES} минут.\n"
-    f"💵 Стоимость консультации — ${PRICE_USD}.\n\n"
+    f"💵 Стоимость консультации — ${PRICE_USD}.\n"
+    "💳 Оплата: 100% предоплата после выбора слота.\n\n"
     "Сначала пройдём короткую анкету, затем выберем время 👇"
 )
 
@@ -380,10 +381,6 @@ def get_sheet():
 
 
 def append_row_sync(row: list):
-    """
-    append_rows + INSERT_ROWS гарантирует добавление новой строки
-    и убирает проблему перезаписи заявок.
-    """
     ws = get_sheet()
     try:
         ws.append_rows([row], value_input_option="RAW", insert_data_option="INSERT_ROWS")
@@ -802,7 +799,13 @@ async def choose_slot(cq: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="🌍 Иностранная карта", callback_data="pay:intl")],
         ]
     )
-    await safe_edit(cq.message, "Выберите способ оплаты (для учёта в заявке):", kb)
+    await safe_edit(
+        cq.message,
+        f"✅ Слот забронирован!\n\n"
+        f"Для подтверждения записи необходима 100% предоплата — ${PRICE_USD}.\n\n"
+        "Выберите способ оплаты:",
+        kb,
+    )
     await cq.answer()
 
 
@@ -814,7 +817,6 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
     start_utc = data.get("slot_start_utc")
     end_utc = data.get("slot_end_utc")
 
-    # Calendar (optional) in executor
     gcal_event_id = ""
     if GCAL_SA_JSON and GCAL_CALENDAR_ID and start_utc and end_utc:
         try:
@@ -836,7 +838,6 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
             print("WARN: Calendar insert failed:", repr(e))
             await notify_admins(f"⚠️ Calendar insert failed: <code>{repr(e)}</code>")
 
-    # Sheets in executor ✅ + INSERT_ROWS to avoid overwrites
     sheets_ok = False
     try:
         if not (GSPREAD_SA_JSON and GSPREAD_SHEET_ID):
@@ -866,7 +867,6 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
         print("WARN: Sheets append failed:", repr(e))
         await notify_admins(f"⚠️ Sheets append failed: <code>{repr(e)}</code>")
 
-    # ✅ Notify admins about new booking (only if sheets OK; можно убрать условие)
     try:
         if sheets_ok:
             tg_username_fallback = "@" + (cq.from_user.username or "") if cq.from_user.username else "-"
@@ -881,7 +881,29 @@ async def payment_pick(cq: CallbackQuery, state: FSMContext):
         print("WARN: notify_admins failed:", repr(e))
 
     await state.clear()
-    await safe_edit(cq.message, "Спасибо! Заявка сохранена. Я свяжусь с вами для подтверждения. 🙌", None)
+
+    if cq.data.endswith("ru"):
+        payment_details = (
+            f"💳 <b>Карта РФ:</b>\n"
+            f"<code>2204 3110 9674 9503</code>\n"
+            f"Получатель: <b>Артем</b>\n\n"
+            f"Сумма: <b>${PRICE_USD}</b>"
+        )
+    else:
+        payment_details = (
+            f"🌍 <b>Перевод (иностранная карта):</b>\n"
+            f"Реквизиты пришлю в личном сообщении.\n\n"
+            f"Сумма: <b>${PRICE_USD}</b>"
+        )
+
+    await safe_edit(
+        cq.message,
+        f"📋 Заявка принята!\n\n"
+        f"Переведите оплату по реквизитам ниже — после подтверждения платежа я свяжусь с вами.\n\n"
+        f"{payment_details}\n\n"
+        f"После оплаты напишите мне в личку или отправьте скриншот. 🙌",
+        None,
+    )
     await cq.answer()
 
 
