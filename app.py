@@ -28,11 +28,8 @@ from sqlalchemy import text
 from dateutil import tz
 from dotenv import load_dotenv
 
-# Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials as SheetsCreds
-
-# Google Calendar (optional)
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials as CalCreds
 
@@ -44,7 +41,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATABASE_URL_ENV = os.getenv("DATABASE_URL", "")
-BASE_URL = os.getenv("BASE_URL", "")  # https://xxxx.up.railway.app
+BASE_URL = os.getenv("BASE_URL", "")
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
 TZ_NAME = os.getenv("TZ", "Europe/Stockholm")
@@ -53,24 +50,21 @@ PRICE_USD = os.getenv("PRICE_USD", "99")
 PRICE_RUB = os.getenv("PRICE_RUB", "8000")
 
 AUTO_SLOTS_DAYS_AHEAD = int(os.getenv("AUTO_SLOTS_DAYS_AHEAD", "30"))
-SHOW_DAYS_AHEAD = int(os.getenv("SHOW_DAYS_AHEAD", "7"))
+MIN_DAYS_AHEAD = int(os.getenv("MIN_DAYS_AHEAD", "2"))
+SHOW_DAYS_AHEAD = int(os.getenv("SHOW_DAYS_AHEAD", "5"))
 SLOTS_DATE_PAGE_SIZE = int(os.getenv("SLOTS_DATE_PAGE_SIZE", "7"))
 
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "13"))
 WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "17"))
 
-# For Railway webhook mode: default 0 (False) so webhook is set automatically
 SKIP_AUTO_WEBHOOK = os.getenv("SKIP_AUTO_WEBHOOK", "0") in ("1", "true", "True")
 
-# Google Sheets
 GSPREAD_SA_JSON = os.getenv("GSPREAD_SERVICE_ACCOUNT_JSON", "")
 GSPREAD_SHEET_ID = os.getenv("GSPREAD_SHEET_ID", "")
 
-# Google Calendar (optional)
 GCAL_SA_JSON = os.getenv("GCAL_SERVICE_ACCOUNT_JSON", "")
-GCAL_CALENDAR_ID = os.getenv("GCAL_CALENDAR_ID", "")  # лучше задавать конкретный ID календаря
+GCAL_CALENDAR_ID = os.getenv("GCAL_CALENDAR_ID", "")
 
-# Cache TTL
 DATES_CACHE_TTL_SEC = int(os.getenv("DATES_CACHE_TTL_SEC", "60"))
 TIMES_CACHE_TTL_SEC = int(os.getenv("TIMES_CACHE_TTL_SEC", "30"))
 
@@ -84,7 +78,7 @@ def mask_token(t: str, keep: int = 8) -> str:
 print("==== DIAG: startup ====")
 print("Python:", sys.version)
 try:
-    import aiogram  # noqa
+    import aiogram
     print("Aiogram:", aiogram.__version__)
 except Exception:
     print("Aiogram: unknown")
@@ -102,17 +96,18 @@ print("GCAL enabled:", bool(GCAL_SA_JSON))
 print("GCAL_CALENDAR_ID:", GCAL_CALENDAR_ID or "EMPTY")
 print("SKIP_AUTO_WEBHOOK:", SKIP_AUTO_WEBHOOK)
 print("TZ:", TZ_NAME)
-print("AUTO_SLOTS_DAYS_AHEAD:", AUTO_SLOTS_DAYS_AHEAD, "SHOW_DAYS_AHEAD:", SHOW_DAYS_AHEAD)
+print("MIN_DAYS_AHEAD:", MIN_DAYS_AHEAD, "SHOW_DAYS_AHEAD:", SHOW_DAYS_AHEAD)
+print("AUTO_SLOTS_DAYS_AHEAD:", AUTO_SLOTS_DAYS_AHEAD)
 print("========================")
 
 if not BOT_TOKEN or ":" not in BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN отсутствует или неверен (получи у @BotFather).")
+    raise RuntimeError("BOT_TOKEN отсутствует или неверен.")
 if not DATABASE_URL_ENV:
-    raise RuntimeError("DATABASE_URL отсутствует (подключи PostgreSQL на Railway).")
+    raise RuntimeError("DATABASE_URL отсутствует.")
 
 
 # ============================================================
-# DB URL normalize + DNS debug
+# DB URL normalize
 # ============================================================
 def normalize_database_url(raw: str) -> str:
     if not raw:
@@ -121,7 +116,6 @@ def normalize_database_url(raw: str) -> str:
         raw = "postgresql+asyncpg://" + raw[len("postgres://"):]
     if raw.startswith("postgresql://") and "+asyncpg" not in raw:
         raw = raw.replace("postgresql://", "postgresql+asyncpg://", 1)
-
     u = urlparse(raw)
     q = dict(parse_qsl(u.query or "", keep_blank_values=True))
     for k in list(q.keys()):
@@ -147,7 +141,7 @@ debug_db_dns(DATABASE_URL)
 
 
 # ============================================================
-# Aiogram & DB engine/session
+# Aiogram & DB
 # ============================================================
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -203,7 +197,7 @@ async def _db_init_schema():
     async with engine.begin() as conn:
         for stmt in SCHEMA_STMTS:
             await conn.execute(text(stmt))
-    print("DB INIT: OK (schema ensured)")
+    print("DB INIT: OK")
 
 
 # ============================================================
@@ -226,13 +220,19 @@ def human_dt(dt_utc: datetime) -> str:
     return dt_utc.astimezone(_tzinfo()).strftime("%d %b %Y, %H:%M")
 
 
-def _cutoff_utc(days_ahead: int = SHOW_DAYS_AHEAD) -> datetime:
+def _start_cutoff_utc() -> datetime:
+    """Самый ранний слот = сейчас + MIN_DAYS_AHEAD."""
     now_local = datetime.now(_tzinfo())
-    return (now_local + timedelta(days=days_ahead)).astimezone(tz.UTC)
+    return (now_local + timedelta(days=MIN_DAYS_AHEAD)).astimezone(tz.UTC)
+
+
+def _cutoff_utc() -> datetime:
+    """Самый поздний слот = сейчас + MIN_DAYS_AHEAD + SHOW_DAYS_AHEAD."""
+    now_local = datetime.now(_tzinfo())
+    return (now_local + timedelta(days=MIN_DAYS_AHEAD + SHOW_DAYS_AHEAD)).astimezone(tz.UTC)
 
 
 async def notify_admins(text_msg: str):
-    """Best-effort notify admins in Telegram."""
     if not ADMIN_IDS:
         return
     for aid in ADMIN_IDS:
@@ -243,7 +243,6 @@ async def notify_admins(text_msg: str):
 
 
 async def safe_edit(msg: Message, text_msg: str, kb: Optional[InlineKeyboardMarkup]):
-    """Avoid crashing on Telegram 'message is not modified'."""
     try:
         await msg.edit_text(text_msg)
         await msg.edit_reply_markup(reply_markup=kb)
@@ -254,31 +253,19 @@ async def safe_edit(msg: Message, text_msg: str, kb: Optional[InlineKeyboardMark
 
 
 def format_new_booking_admin_message(data: dict, tg_user_id: int, tg_username_fallback: str, gcal_event_id: str) -> str:
-    name = data.get("name") or "-"
-    tg_username = data.get("tg_username") or tg_username_fallback or "-"
-    phone = data.get("phone") or "-"
-    ship_type = data.get("ship_type") or "-"
-    position = data.get("position") or "-"
-    exp = data.get("experience") or "-"
-    topic = data.get("topic") or "-"
-    slot_start = data.get("slot_start_local") or "-"
-    slot_end = data.get("slot_end_local") or "-"
-    pm = data.get("payment_method") or "-"
-    gcal = gcal_event_id or "-"
-
     return (
         "✅ <b>Новая запись на консультацию</b>\n\n"
-        f"👤 <b>Имя:</b> {name}\n"
+        f"👤 <b>Имя:</b> {data.get('name') or '-'}\n"
         f"🆔 <b>TG ID:</b> <code>{tg_user_id}</code>\n"
-        f"🔗 <b>Ник:</b> {tg_username}\n"
-        f"📞 <b>Телефон:</b> {phone}\n\n"
-        f"🚢 <b>Судно:</b> {ship_type}\n"
-        f"🎖 <b>Должность:</b> {position}\n"
-        f"⏳ <b>Опыт:</b> {exp}\n\n"
-        f"📝 <b>Тема:</b> {topic}\n\n"
-        f"🗓 <b>Слот:</b> {slot_start} — {slot_end}\n"
-        f"💳 <b>Оплата:</b> {pm}\n"
-        f"📅 <b>GCAL:</b> {gcal}\n"
+        f"🔗 <b>Ник:</b> {data.get('tg_username') or tg_username_fallback or '-'}\n"
+        f"📞 <b>Телефон:</b> {data.get('phone') or '-'}\n\n"
+        f"🚢 <b>Судно:</b> {data.get('ship_type') or '-'}\n"
+        f"🎖 <b>Должность:</b> {data.get('position') or '-'}\n"
+        f"⏳ <b>Опыт:</b> {data.get('experience') or '-'}\n\n"
+        f"📝 <b>Тема:</b> {data.get('topic') or '-'}\n\n"
+        f"🗓 <b>Слот:</b> {data.get('slot_start_local') or '-'} — {data.get('slot_end_local') or '-'}\n"
+        f"💳 <b>Оплата:</b> {data.get('payment_method') or '-'}\n"
+        f"📅 <b>GCAL:</b> {gcal_event_id or '-'}\n"
     )
 
 
@@ -323,9 +310,7 @@ async def ensure_slots_for_range(days_ahead: int):
                     {"s": start_utc, "e": end_utc},
                 )
         await s.commit()
-    print(
-        f"AUTO-SLOTS: ensured next {days_ahead} days (weekdays {WORK_START_HOUR}:00–{WORK_END_HOUR}:00, {SLOT_MINUTES} min)."
-    )
+    print(f"AUTO-SLOTS: ensured next {days_ahead} days.")
 
 
 async def auto_slots_loop():
@@ -338,7 +323,7 @@ async def auto_slots_loop():
 
 
 # ============================================================
-# Google Sheets (lazy init, SYNC only)
+# Google Sheets
 # ============================================================
 _sheet = None
 
@@ -347,28 +332,17 @@ def get_sheet():
     global _sheet
     if _sheet is None:
         if not GSPREAD_SA_JSON or not GSPREAD_SHEET_ID:
-            raise RuntimeError("Google Sheets не настроен (нет GSPREAD_*).")
+            raise RuntimeError("Google Sheets не настроен.")
         sa_info = json.loads(GSPREAD_SA_JSON)
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = SheetsCreds.from_service_account_info(sa_info, scopes=scopes)
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(GSPREAD_SHEET_ID)
         ws = sh.sheet1
-
         headers = [
-            "timestamp",
-            "tg_id",
-            "tg_username",
-            "name",
-            "phone",
-            "ship_type",
-            "position",
-            "experience",
-            "topic",
-            "slot_start_local",
-            "slot_end_local",
-            "payment_method",
-            "gcal_event_id",
+            "timestamp", "tg_id", "tg_username", "name", "phone",
+            "ship_type", "position", "experience", "topic",
+            "slot_start_local", "slot_end_local", "payment_method", "gcal_event_id",
         ]
         try:
             first = ws.row_values(1)
@@ -376,27 +350,21 @@ def get_sheet():
                 ws.append_rows([headers], value_input_option="RAW", insert_data_option="INSERT_ROWS")
         except Exception:
             ws.append_rows([headers], value_input_option="RAW", insert_data_option="INSERT_ROWS")
-
         _sheet = ws
     return _sheet
 
 
 def append_row_sync(row: list):
-    """
-    append_rows + INSERT_ROWS гарантирует добавление новой строки
-    и убирает проблему перезаписи заявок.
-    """
     ws = get_sheet()
     try:
         ws.append_rows([row], value_input_option="RAW", insert_data_option="INSERT_ROWS")
-        return
     except Exception:
         time.sleep(2)
         ws.append_rows([row], value_input_option="RAW", insert_data_option="INSERT_ROWS")
 
 
 # ============================================================
-# Google Calendar (optional)
+# Google Calendar
 # ============================================================
 _gcal = None
 
@@ -405,7 +373,7 @@ def get_calendar():
     global _gcal
     if _gcal is None:
         if not GCAL_SA_JSON:
-            raise RuntimeError("Google Calendar не настроен (нет GCAL_SERVICE_ACCOUNT_JSON).")
+            raise RuntimeError("Google Calendar не настроен.")
         sa_info = json.loads(GCAL_SA_JSON)
         scopes = ["https://www.googleapis.com/auth/calendar"]
         creds = CalCreds.from_service_account_info(sa_info, scopes=scopes)
@@ -440,8 +408,8 @@ class Form(StatesGroup):
     position = State()
     experience = State()
     topic = State()
-    waiting_slot = State()
     payment_method = State()
+    waiting_slot = State()
 
 
 # ============================================================
@@ -452,7 +420,7 @@ _times_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
 
 def _cache_key_dates() -> str:
-    return f"{TZ_NAME}:{SHOW_DAYS_AHEAD}"
+    return f"{TZ_NAME}:{MIN_DAYS_AHEAD}:{SHOW_DAYS_AHEAD}"
 
 
 def _dates_cache_get() -> Optional[List[Dict[str, Any]]]:
@@ -486,13 +454,14 @@ def _times_cache_set(date_str: str, data: List[Dict[str, Any]]):
 
 
 # ============================================================
-# Fast queries
+# Queries
 # ============================================================
 async def fetch_available_dates_counts(session: AsyncSession) -> List[Dict[str, Any]]:
     cached = _dates_cache_get()
     if cached is not None:
         return cached
 
+    start_cutoff = _start_cutoff_utc()
     cutoff = _cutoff_utc()
     q = text(
         f"""
@@ -501,13 +470,13 @@ async def fetch_available_dates_counts(session: AsyncSession) -> List[Dict[str, 
             COUNT(*) AS cnt
         FROM slots
         WHERE is_booked = false
-          AND start_utc > NOW()
+          AND start_utc >= :start_cutoff
           AND start_utc < :cutoff
         GROUP BY 1
         ORDER BY 1
         """
     )
-    rows = (await session.execute(q, {"cutoff": cutoff})).mappings().all()
+    rows = (await session.execute(q, {"start_cutoff": start_cutoff, "cutoff": cutoff})).mappings().all()
     data = [{"local_date": r["local_date"], "count": int(r["cnt"])} for r in rows]
     _dates_cache_set(data)
     return data
@@ -532,11 +501,15 @@ async def get_free_slots_for_local_date(session: AsyncSession, date_str: str) ->
         WHERE is_booked = false
           AND start_utc >= :s
           AND start_utc <  :e
+          AND start_utc >= :start_cutoff
           AND start_utc <  :cutoff
         ORDER BY start_utc ASC
         """
     )
-    rows = (await session.execute(q, {"s": start_utc, "e": end_utc, "cutoff": _cutoff_utc()})).mappings().all()
+    rows = (await session.execute(q, {
+        "s": start_utc, "e": end_utc,
+        "start_cutoff": _start_cutoff_utc(), "cutoff": _cutoff_utc(),
+    })).mappings().all()
     data = [dict(r) for r in rows]
     _times_cache_set(date_str, data)
     return data
@@ -549,7 +522,7 @@ def build_dates_kb(all_days: List[Dict[str, Any]], page: int) -> Tuple[str, Inli
     total = len(all_days)
     if total == 0:
         return (
-            "Свободных дат в ближайшие дни нет. Напишите желаемое время — постараюсь подстроиться.",
+            "Свободных дат нет. Напишите желаемое время — постараюсь подстроиться.",
             InlineKeyboardMarkup(inline_keyboard=[]),
         )
 
@@ -580,7 +553,7 @@ def build_dates_kb(all_days: List[Dict[str, Any]], page: int) -> Tuple[str, Inli
         rows.append(nav)
 
     return (
-        f"Выберите дату (показаны ближайшие {SHOW_DAYS_AHEAD} дней): {start+1}–{end} из {total}",
+        f"Выберите дату ({start+1}–{end} из {total}):",
         InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
@@ -600,12 +573,10 @@ def build_times_kb(slots: List[Dict[str, Any]], date_str: str) -> Tuple[str, Inl
     if row:
         rows.append(row)
 
-    rows.append(
-        [
-            InlineKeyboardButton(text="↻ Обновить", callback_data=f"refresh:{date_str}"),
-            InlineKeyboardButton(text="« К датам", callback_data="dates:0"),
-        ]
-    )
+    rows.append([
+        InlineKeyboardButton(text="↻ Обновить", callback_data=f"refresh:{date_str}"),
+        InlineKeyboardButton(text="« К датам", callback_data="dates:0"),
+    ])
     return ("Выберите время:", InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -633,7 +604,6 @@ def _form_completed_guard(func):
                     pass
             return
         return await func(event, state)
-
     return wrapper
 
 
@@ -670,7 +640,6 @@ async def form_name(m: Message, state: FSMContext):
 @dp.message(Form.tg_username)
 async def form_tg(m: Message, state: FSMContext):
     txt = (m.text or "").strip()
-    # Если пользователь пропускает — берём из профиля, если есть
     if txt == "-" or not txt:
         un = m.from_user.username or ""
         if un:
@@ -735,6 +704,52 @@ async def form_topic(m: Message, state: FSMContext):
         "Выберите способ оплаты:",
         reply_markup=kb,
     )
+
+
+@dp.callback_query(F.data.startswith("pay:"))
+async def payment_pick(cq: CallbackQuery, state: FSMContext):
+    pm = "Карта РФ" if cq.data.endswith("ru") else "Иностранная карта"
+    await state.update_data(payment_method=pm)
+
+    if cq.data.endswith("ru"):
+        payment_text = (
+            f"💳 <b>Переведите {PRICE_RUB} ₽ / ${PRICE_USD} на карту:</b>\n"
+            f"<code>2204 3110 9674 9503</code>\n"
+            f"Получатель: <b>Артем</b>\n\n"
+            f"После оплаты напишите мне и отправьте скриншот платежа:\n"
+            f'👉 <a href="https://t.me/ilinartem">@ilinartem</a>\n\n'
+            f"Затем выберите удобный слот 👇"
+        )
+    else:
+        payment_text = (
+            f"🌍 <b>Иностранная карта</b>\n\n"
+            f"Напишите мне — я пришлю реквизиты для перевода:\n"
+            f'👉 <a href="https://t.me/ilinartem">@ilinartem</a>\n\n'
+            f"Сумма: <b>${PRICE_USD}</b>\n\n"
+            f"После оплаты выберите удобный слот 👇"
+        )
+        try:
+            data = await state.get_data()
+            tg_un = data.get("tg_username") or ("@" + (cq.from_user.username or "")) or "-"
+            await notify_admins(
+                f"🌍 <b>Запрос реквизитов (иностранная карта)</b>\n\n"
+                f"Пользователь хочет оплатить иностранной картой — нужно выслать реквизиты.\n"
+                f"👤 <b>Имя:</b> {data.get('name') or '-'}\n"
+                f"🔗 <b>Ник:</b> {tg_un}\n"
+                f"🆔 <b>TG ID:</b> <code>{cq.from_user.id}</code>"
+            )
+        except Exception as e:
+            print("WARN: notify_admins (intl) failed:", repr(e))
+
+    await state.set_state(Form.waiting_slot)
+
+    async with Session() as s:
+        all_days = await fetch_available_dates_counts(s)
+    slots_text, slots_kb = build_dates_kb(all_days, page=0)
+
+    await cq.message.edit_text(payment_text, disable_web_page_preview=True)
+    await cq.message.answer(slots_text, reply_markup=slots_kb)
+    await cq.answer()
 
 
 @dp.callback_query(F.data.startswith("dates:"))
@@ -812,7 +827,7 @@ async def choose_slot(cq: CallbackQuery, state: FSMContext):
     except Exception:
         pass
 
-    # Calendar (optional)
+    # Calendar
     gcal_event_id = ""
     if GCAL_SA_JSON and GCAL_CALENDAR_ID:
         try:
@@ -838,7 +853,7 @@ async def choose_slot(cq: CallbackQuery, state: FSMContext):
     sheets_ok = False
     try:
         if not (GSPREAD_SA_JSON and GSPREAD_SHEET_ID):
-            print("INFO: Sheets not configured; skipping append.")
+            print("INFO: Sheets not configured; skipping.")
         else:
             now = datetime.utcnow().isoformat()
             row_data = [
@@ -868,13 +883,12 @@ async def choose_slot(cq: CallbackQuery, state: FSMContext):
     try:
         if sheets_ok:
             tg_username_fallback = "@" + (cq.from_user.username or "") if cq.from_user.username else "-"
-            msg = format_new_booking_admin_message(
+            await notify_admins(format_new_booking_admin_message(
                 data=data,
                 tg_user_id=cq.from_user.id,
                 tg_username_fallback=tg_username_fallback,
                 gcal_event_id=gcal_event_id,
-            )
-            await notify_admins(msg)
+            ))
     except Exception as e:
         print("WARN: notify_admins failed:", repr(e))
 
@@ -887,53 +901,6 @@ async def choose_slot(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 
-@dp.callback_query(F.data.startswith("pay:"))
-async def payment_pick(cq: CallbackQuery, state: FSMContext):
-    pm = "Карта РФ" if cq.data.endswith("ru") else "Иностранная карта"
-    await state.update_data(payment_method=pm)
-
-    if cq.data.endswith("ru"):
-        payment_text = (
-            f"💳 <b>Переведите {PRICE_RUB} ₽ / ${PRICE_USD} на карту:</b>\n"
-            f"<code>2204 3110 9674 9503</code>\n"
-            f"Получатель: <b>Артем</b>\n\n"
-            f"После оплаты напишите мне и отправьте скриншот платежа:\n"
-            f'👉 <a href="https://t.me/ilinartem">@ilinartem</a>\n\n'
-            f"Затем выберите удобный слот 👇"
-        )
-    else:
-        payment_text = (
-            f"🌍 <b>Иностранная карта</b>\n\n"
-            f"Напишите мне — я пришлю реквизиты для перевода:\n"
-            f'👉 <a href="https://t.me/ilinartem">@ilinartem</a>\n\n'
-            f"Сумма: <b>${PRICE_USD}</b>\n\n"
-            f"После оплаты выберите удобный слот 👇"
-        )
-        # Уведомить админа о запросе реквизитов
-        try:
-            data = await state.get_data()
-            tg_un = data.get("tg_username") or ("@" + (cq.from_user.username or "")) or "-"
-            await notify_admins(
-                f"🌍 <b>Запрос реквизитов (иностранная карта)</b>\n\n"
-                f"Пользователь хочет оплатить иностранной картой — нужно выслать реквизиты.\n"
-                f"👤 <b>Имя:</b> {data.get('name') or '-'}\n"
-                f"🔗 <b>Ник:</b> {tg_un}\n"
-                f"🆔 <b>TG ID:</b> <code>{cq.from_user.id}</code>"
-            )
-        except Exception as e:
-            print("WARN: notify_admins (intl) failed:", repr(e))
-
-    await state.set_state(Form.waiting_slot)
-
-    async with Session() as s:
-        all_days = await fetch_available_dates_counts(s)
-    slots_text, slots_kb = build_dates_kb(all_days, page=0)
-
-    await cq.message.edit_text(payment_text, disable_web_page_preview=True)
-    await cq.message.answer(slots_text, reply_markup=slots_kb)
-    await cq.answer()
-
-
 # ============================================================
 # Admin
 # ============================================================
@@ -943,9 +910,9 @@ async def admin_menu(m: Message):
         return
     await m.answer(
         "Админ команды:\n"
-        "/autofill — сгенерировать слоты на ближайшие дни (AUTO_SLOTS_DAYS_AHEAD)\n"
-        "/testsheet — записать тестовую строку в Google Sheet\n"
-        "/myid — покажет твой Telegram ID\n"
+        "/autofill — сгенерировать слоты\n"
+        "/testsheet — тест Google Sheets\n"
+        "/myid — твой Telegram ID\n"
     )
 
 
@@ -968,17 +935,17 @@ async def testsheet(m: Message):
         return
     try:
         if not (GSPREAD_SA_JSON and GSPREAD_SHEET_ID):
-            await m.answer("⚠️ Sheets не настроен (нет GSPREAD_* env).")
+            await m.answer("⚠️ Sheets не настроен.")
             return
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: append_row_sync(["test", datetime.utcnow().isoformat()]))
-        await m.answer("✅ Тестовая строка записана в таблицу.")
+        await m.answer("✅ Тестовая строка записана.")
     except Exception as e:
-        await m.answer(f"⚠️ Ошибка Google Sheets: <code>{repr(e)}</code>")
+        await m.answer(f"⚠️ Ошибка: <code>{repr(e)}</code>")
 
 
 # ============================================================
-# Webhook / Server (Railway)
+# Webhook / Server
 # ============================================================
 async def on_startup():
     await _db_self_test()
@@ -987,12 +954,12 @@ async def on_startup():
     asyncio.create_task(auto_slots_loop())
 
     if SKIP_AUTO_WEBHOOK:
-        print("INFO: SKIP_AUTO_WEBHOOK=1 — пропускаю setWebhook (поставь вручную через Telegram API).")
+        print("INFO: SKIP_AUTO_WEBHOOK=1")
         return
 
     if not BASE_URL:
-        print("WARN: BASE_URL пустой — не могу поставить webhook.")
-        await notify_admins("⚠️ BASE_URL пустой — бот не сможет поставить webhook автоматически.")
+        print("WARN: BASE_URL пустой.")
+        await notify_admins("⚠️ BASE_URL пустой — вебхук не установлен.")
         return
 
     try:
